@@ -2,36 +2,22 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { Loader2 } from 'lucide-react';
+import { CheckCircle2 } from 'lucide-react';
 import { useLocale } from '@/components/LocaleProvider';
-import { getExtraCopy } from '@/lib/i18n/extra';
 import { localizeBoatType, localizeZone } from '@/lib/i18n/options';
 import { createClient } from '@/lib/supabase/client';
-import { Button, ErrorBanner, Field, TextArea, TextInput } from '@/components/ui';
+import { friendlyError } from '@/lib/errors';
+import { Button, ErrorBanner, Field, FieldGroup, LoadingState, TextArea, TextInput } from '@/components/ui';
+import MultiSelectTags from '@/components/multi-select-tags';
 import PhoneInput from '@/components/phone-input';
 import type { Profile } from '@/lib/database.types';
-import { phoneValueFromStored, getPhoneStorageValue, validatePhoneValue, type PhoneValue } from '@/lib/phone';
+import { getPhoneStorageValue, phoneValueFromStored, validatePhoneValue, type PhoneValue } from '@/lib/phone';
 import { dashboardHrefForRole, isRoleProfileReady, missingRoleFields } from '@/lib/onboarding';
 import { NAVIGATION_ZONES, SKIPPER_BOAT_TYPES } from '@/lib/profile-options';
 
-function Tag({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`text-sm font-medium px-3.5 py-2 rounded-full mr-2 mb-2 border-[1.5px] ${
-        active ? 'bg-navy text-white border-navy' : 'bg-white text-anthracite border-gray-200'
-      }`}
-    >
-      {label}
-    </button>
-  );
-}
-
 export default function OnboardingPage() {
   const router = useRouter();
-  const { copy, locale } = useLocale();
-  const extra = getExtraCopy(locale);
+  const { copy } = useLocale();
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [profile, setProfile] = useState<Profile | null>(null);
@@ -47,40 +33,34 @@ export default function OnboardingPage() {
   useEffect(() => {
     const supabase = createClient();
     (async () => {
-      const {
-        data: { user },
-      } = await supabase.auth.getUser();
-
+      const { data: { user } } = await supabase.auth.getUser();
       if (!user) {
         router.replace('/login?next=/onboarding');
         return;
       }
-
       const { data, error: profileError } = await supabase.from('profiles').select('*').eq('id', user.id).single();
       if (profileError || !data) {
-        setError(profileError?.message || extra.errors.loadProfile);
+        setError(profileError ? friendlyError(copy, profileError) : copy.onboarding.profileNotFound);
         setLoading(false);
         return;
       }
-
-      const p = data as Profile;
-      if (p.onboarding_completed_at) {
-        router.replace(dashboardHrefForRole(p.role));
+      const current = data as Profile;
+      if (current.onboarding_completed_at) {
+        router.replace(dashboardHrefForRole(current.role));
         return;
       }
-
-      setProfile(p);
-      setPhone(phoneValueFromStored(p.phone));
-      setCompanyName(p.company_name || '');
-      setFleetSize(p.fleet_size?.toString() || '');
-      setZones(p.zones || []);
-      setBoatTypes(p.boat_types || []);
-      setBio(p.bio || '');
+      setProfile(current);
+      setPhone(phoneValueFromStored(current.phone));
+      setCompanyName(current.company_name || '');
+      setFleetSize(current.fleet_size?.toString() || '');
+      setZones(current.zones || []);
+      setBoatTypes(current.boat_types || []);
+      setBio(current.bio || '');
       setLoading(false);
     })();
-  }, [extra.errors.loadProfile, router]);
+  }, [copy, router]);
 
-  const previewProfile = useMemo<Profile | null>(() => {
+  const preview = useMemo<Profile | null>(() => {
     if (!profile) return null;
     return {
       ...profile,
@@ -93,132 +73,114 @@ export default function OnboardingPage() {
     };
   }, [profile, phone, companyName, fleetSize, zones, boatTypes, bio]);
 
-  const missing = previewProfile ? missingRoleFields(previewProfile) : [];
+  const missing = preview ? missingRoleFields(preview) : [];
 
-  function toggle(list: string[], setList: (v: string[]) => void, value: string) {
+  function toggle(list: string[], setList: (value: string[]) => void, value: string) {
     setList(list.includes(value) ? list.filter((entry) => entry !== value) : [...list, value]);
   }
 
   async function saveProfile(markDone: boolean) {
-    if (!profile) return;
-    setSaving(true);
+    if (!profile || !preview) return;
     setError('');
-
-    const supabase = createClient();
-
-    const updates: Record<string, unknown> = {
-      phone: getPhoneStorageValue(phone) || null,
-      company_name: companyName || null,
-      fleet_size: fleetSize ? Number(fleetSize) : null,
-      zones,
-      boat_types: boatTypes,
-      bio: bio || null,
-      onboarding_step: markDone ? 'done' : 'role_details',
-      onboarding_completed_at: markDone ? new Date().toISOString() : null,
-    };
-
-    if (markDone && previewProfile && !isRoleProfileReady(previewProfile)) {
-      setSaving(false);
-      setError(extra.onboarding.completeRequired);
-      return;
-    }
-
-    const phoneError = validatePhoneValue(phone, profile.role !== 'skipper', locale);
+    const phoneError = validatePhoneValue(phone, profile.role !== 'skipper');
     if (phoneError) {
-      setSaving(false);
-      setError(phoneError);
+      setError(copy.phone[phoneError]);
       return;
     }
-
-    const { error: updErr } = await supabase.from('profiles').update(updates).eq('id', profile.id);
+    if (markDone && !isRoleProfileReady(preview)) {
+      setError(copy.onboarding.completeRequired);
+      return;
+    }
+    setSaving(true);
+    const supabase = createClient();
+    const { error: updateError } = await supabase
+      .from('profiles')
+      .update({
+        phone: getPhoneStorageValue(phone) || null,
+        company_name: companyName.trim() || null,
+        fleet_size: fleetSize ? Number(fleetSize) : null,
+        zones,
+        boat_types: boatTypes,
+        bio: bio.trim() || null,
+        onboarding_step: markDone ? 'done' : 'role_details',
+        onboarding_completed_at: markDone ? new Date().toISOString() : null,
+      })
+      .eq('id', profile.id);
     setSaving(false);
-
-    if (updErr) {
-      setError(updErr.message);
+    if (updateError) {
+      setError(friendlyError(copy, updateError));
       return;
     }
-
     if (markDone) {
       router.replace(dashboardHrefForRole(profile.role));
-      return;
+      router.refresh();
     }
-
-    router.refresh();
   }
 
-  if (loading) {
-    return (
-      <div className="flex items-center gap-2 py-16 justify-center text-gray-500">
-        <Loader2 className="animate-spin" size={20} /> {copy.common.loading}
-      </div>
-    );
-  }
-
+  if (loading) return <LoadingState label={copy.common.loading} />;
   if (!profile) {
     return (
-      <main className="max-w-md mx-auto px-6 py-10">
-        <p>{extra.onboarding.profileNotFound}</p>
+      <main className="mx-auto max-w-md px-4 py-10 sm:px-6">
+        <ErrorBanner message={error || copy.onboarding.profileNotFound} />
       </main>
     );
   }
 
   return (
-    <main className="max-w-xl mx-auto px-6 py-10">
-      <h1 className="font-display text-3xl font-bold mb-2">{copy.nav.profile}</h1>
-      <p className="text-sm text-gray-500 mb-6">
-        {copy.nav.profile}
-      </p>
+    <main className="mx-auto max-w-xl px-4 py-10 sm:px-6">
+      <h1 className="font-display mb-2 text-3xl font-bold text-marine">{copy.onboarding.title}</h1>
+      <p className="mb-6 text-sm text-gray-500">{copy.onboarding.description}</p>
       <ErrorBanner message={error} />
 
-      <div className="rounded-2xl p-5 mb-6 bg-white border border-navy/[0.08]">
-        <h2 className="font-semibold mb-2">{copy.nav.profile}</h2>
+      <div className="mb-6 rounded-2xl border border-navy/[0.08] bg-white p-5">
         {missing.length === 0 ? (
-          <p className="text-sm text-emerald-700">{extra.onboarding.ready}</p>
+          <p className="flex items-center gap-2 text-sm text-emerald-700"><CheckCircle2 size={16} /> {copy.onboarding.ready}</p>
         ) : (
-          <ul className="text-sm text-gray-600 list-disc pl-5 space-y-1">
-            {missing.map((item) => (
-              <li key={item}>{item}</li>
-            ))}
-          </ul>
+          <>
+            <h2 className="mb-2 text-sm font-semibold">{copy.onboarding.checklist}</h2>
+            <ul className="list-disc space-y-1 ps-5 text-sm text-gray-600">
+              {missing.map((item) => <li key={item}>{copy.onboarding.missing[item]}</li>)}
+            </ul>
+          </>
         )}
       </div>
 
-      <form onSubmit={(e) => e.preventDefault()}>
-        <Field label={copy.common.phone}>
+      <form onSubmit={(event) => event.preventDefault()}>
+        <FieldGroup label={copy.common.phone}>
           <PhoneInput value={phone} onChange={setPhone} required={profile.role !== 'skipper'} />
-        </Field>
+        </FieldGroup>
 
         {(profile.role === 'broker' || profile.role === 'charter_company') && (
           <>
             <Field label={copy.signup.companyName}>
-              <TextInput value={companyName} onChange={(e) => setCompanyName(e.target.value)} />
+              <TextInput value={companyName} onChange={(event) => setCompanyName(event.target.value)} />
             </Field>
             <Field label={copy.signup.fleetSize}>
-              <TextInput type="number" min="0" value={fleetSize} onChange={(e) => setFleetSize(e.target.value)} />
+              <TextInput type="number" min="0" inputMode="numeric" value={fleetSize} onChange={(event) => setFleetSize(event.target.value)} />
             </Field>
           </>
         )}
 
         {profile.role === 'skipper' && (
           <>
-            <Field label={copy.signup.zones}>
-              <div>{NAVIGATION_ZONES.map((zone) => <Tag key={zone} label={localizeZone(zone, locale)} active={zones.includes(zone)} onClick={() => toggle(zones, setZones, zone)} />)}</div>
-            </Field>
-            <Field label={copy.signup.boatTypes}>
-              <div>{SKIPPER_BOAT_TYPES.map((boat) => <Tag key={boat} label={localizeBoatType(boat, locale)} active={boatTypes.includes(boat)} onClick={() => toggle(boatTypes, setBoatTypes, boat)} />)}</div>
-            </Field>
+            <FieldGroup label={copy.signup.zones}>
+              <MultiSelectTags options={NAVIGATION_ZONES} selected={zones} onToggle={(value) => toggle(zones, setZones, value)} labelFor={(value) => localizeZone(copy, value)} />
+            </FieldGroup>
+            <FieldGroup label={copy.signup.boatTypes}>
+              <MultiSelectTags options={SKIPPER_BOAT_TYPES} selected={boatTypes} onToggle={(value) => toggle(boatTypes, setBoatTypes, value)} labelFor={(value) => localizeBoatType(copy, value)} />
+            </FieldGroup>
             <Field label={copy.signup.bio}>
-              <TextArea value={bio} onChange={(e) => setBio(e.target.value)} />
+              <TextArea value={bio} maxLength={2000} placeholder={copy.signup.bioPlaceholder} onChange={(event) => setBio(event.target.value)} />
             </Field>
           </>
         )}
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-4">
+        <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
           <Button type="button" variant="outline" onClick={() => saveProfile(false)} disabled={saving}>
-            {copy.common.save}
+            {copy.onboarding.saveDraft}
           </Button>
-          <Button type="button" onClick={() => saveProfile(true)} disabled={saving}>
-            {saving ? '...' : extra.onboarding.finish}
+          <Button type="button" onClick={() => saveProfile(true)} loading={saving}>
+            {copy.onboarding.finish}
           </Button>
         </div>
       </form>

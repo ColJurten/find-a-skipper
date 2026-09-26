@@ -2,146 +2,201 @@
 
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { Loader2 } from 'lucide-react';
 import { useLocale } from '@/components/LocaleProvider';
+import { Button, ErrorBanner, Field, LoadingState, Select, TextArea, TextInput } from '@/components/ui';
 import { createClient } from '@/lib/supabase/client';
 import { buildVerifyEmailPath, isEmailVerified } from '@/lib/auth';
-import { getExtraCopy } from '@/lib/i18n/extra';
+import { friendlyError } from '@/lib/errors';
 import { localizeBoatType, localizeMissionType, localizeZone } from '@/lib/i18n/options';
-import { Field, TextInput, TextArea, Select, Button, ErrorBanner } from '@/components/ui';
-import type { Profile } from '@/lib/database.types';
-
-const ZONES = ['Méditerranée', 'Atlantique', 'Manche / Mer du Nord', 'Bretagne', 'Outre-mer'];
-const BOAT_TYPES = ['Voilier', 'Moteur', 'Catamaran', 'Grande unité (+20m)'];
-const MISSION_TYPES = ['À la journée', 'À la semaine', 'Saisonnier', 'Convoyage', 'Autre'];
+import { isSingleDayMissionType, parseDecimal, validateMissionForm } from '@/lib/mission';
+import { isRecruiterRole } from '@/lib/onboarding';
+import { MISSION_TYPES, NAVIGATION_ZONES, SKIPPER_BOAT_TYPES } from '@/lib/profile-options';
+import type { MissionCurrency } from '@/lib/database.types';
 
 export default function NewMissionPage() {
   const router = useRouter();
-  const { copy, locale } = useLocale();
-  const extra = getExtraCopy(locale);
-  const [profile, setProfile] = useState<Profile | null>(null);
+  const { copy } = useLocale();
+  const [userId, setUserId] = useState<string | null>(null);
   const [checking, setChecking] = useState(true);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
-  const [type, setType] = useState(MISSION_TYPES[0]);
-  const [boatType, setBoatType] = useState(BOAT_TYPES[0]);
-  const [zone, setZone] = useState(ZONES[0]);
+  const [type, setType] = useState<string>(MISSION_TYPES[0]);
+  const [boatType, setBoatType] = useState<string>(SKIPPER_BOAT_TYPES[0]);
+  const [zone, setZone] = useState<string>(NAVIGATION_ZONES[0]);
   const [departure, setDeparture] = useState('');
   const [destination, setDestination] = useState('');
   const [startDate, setStartDate] = useState('');
-  const [duration, setDuration] = useState('');
-  const [compensation, setCompensation] = useState('');
-  const [requirements, setRequirements] = useState('');
+  const [endDate, setEndDate] = useState('');
+  const [hours, setHours] = useState('');
+  const [amount, setAmount] = useState('');
+  const [currency, setCurrency] = useState<MissionCurrency>('EUR');
+  const [onQuote, setOnQuote] = useState(false);
+  const [permit, setPermit] = useState('');
   const [description, setDescription] = useState('');
-
-  function missionPayload(includeRequirements: boolean) {
-    const baseDescription = description.trim();
-    const req = requirements.trim();
-    const generatedTitle = `${type} - ${departure.trim()}${destination.trim() ? ` vers ${destination.trim()}` : ''}`;
-    const fallbackDescription =
-      !includeRequirements && req
-        ? `${baseDescription ? `${baseDescription}\n\n` : ''}Exigences: ${req}`
-        : baseDescription;
-
-    return {
-      poster_id: profile!.id,
-      title: generatedTitle,
-      type,
-      boat_type: boatType,
-      zone,
-      departure,
-      destination: destination || null,
-      start_date: startDate,
-      duration: duration || null,
-      compensation: compensation || null,
-      ...(includeRequirements ? { requirements: req || null } : {}),
-      description: fallbackDescription || null,
-    };
-  }
+  const singleDay = isSingleDayMissionType(type);
+  const today = new Date().toISOString().slice(0, 10);
 
   useEffect(() => {
     const supabase = createClient();
     (async () => {
       const { data: { user } } = await supabase.auth.getUser();
-      if (!user) { router.push('/login'); return; }
+      if (!user) {
+        router.replace('/login?next=/missions/new');
+        return;
+      }
       if (!isEmailVerified(user)) {
         router.replace(buildVerifyEmailPath(user.email || null, '/missions/new'));
         return;
       }
-      const { data } = await supabase.from('profiles').select('*').eq('id', user.id).single();
-      if (!data || !['owner', 'broker', 'charter_company'].includes(data.role)) {
-        router.push('/dashboard');
+      const { data } = await supabase.from('profiles').select('role').eq('id', user.id).single();
+      if (!data || !isRecruiterRole(data.role)) {
+        router.replace('/dashboard');
         return;
       }
-      setProfile(data as Profile);
+      setUserId(user.id);
       setChecking(false);
     })();
   }, [router]);
 
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
+  async function handleSubmit(event: React.FormEvent) {
+    event.preventDefault();
     setError('');
-    if (!departure || !startDate) { setError(extra.missionsNew.minFields); return; }
+    const formError = validateMissionForm({ type, departure, startDate, endDate, hours, amount });
+    if (formError) {
+      setError(copy.missionForm.errors[formError]);
+      return;
+    }
+    if (!userId) return;
+
+    const durationHours = parseDecimal(hours);
+    const compensationAmount = parseDecimal(amount);
     setLoading(true);
     const supabase = createClient();
-
-    let { data: mission, error: insErr } = await supabase
+    const { error: insertError } = await supabase
       .from('missions')
-      .insert(missionPayload(true))
-      .select()
+      .insert({
+        poster_id: userId,
+        status: 'open',
+        type,
+        boat_type: boatType,
+        zone,
+        departure: departure.trim(),
+        destination: destination.trim() || null,
+        start_date: startDate,
+        end_date: singleDay ? null : endDate || null,
+        duration_hours: durationHours,
+        duration: durationHours ? `${durationHours} h` : null,
+        compensation_amount: compensationAmount,
+        currency,
+        on_quote: onQuote,
+        compensation: compensationAmount !== null ? `${compensationAmount} ${currency === 'EUR' ? '€' : '$'}` : null,
+        requirements: permit.trim() || null,
+        description: description.trim() || null,
+      })
+      .select('id')
       .single();
-
-    if (insErr && /Could not find the 'requirements' column/i.test(insErr.message)) {
-      ({ data: mission, error: insErr } = await supabase
-        .from('missions')
-        .insert(missionPayload(false))
-        .select()
-        .single());
-    }
-
     setLoading(false);
-    if (insErr) { setError(insErr.message); return; }
-    router.push(`/missions/${mission.id}?created=1`);
+    if (insertError) {
+      setError(friendlyError(copy, insertError));
+      return;
+    }
+    router.push('/my-missions?created=1');
+    router.refresh();
   }
 
-  if (checking) return <div className="flex items-center gap-2 py-16 justify-center text-gray-500"><Loader2 className="animate-spin" size={20} /> {copy.common.loading}</div>;
+  if (checking) return <LoadingState label={copy.common.loading} />;
 
   return (
-    <main className="max-w-lg mx-auto px-6 py-10">
-      <h1 className="font-display text-2xl font-bold mb-1">{copy.nav.publishMission}</h1>
-      <p className="text-sm mb-6 text-gray-500">{copy.missions.open}</p>
+    <main className="mx-auto max-w-2xl px-4 py-10 sm:px-6">
+      <h1 className="font-display mb-1 text-3xl font-bold text-marine">{copy.missionForm.title}</h1>
+      <p className="mb-6 text-sm text-gray-500">{copy.missionForm.subtitle}</p>
       <ErrorBanner message={error} />
-      <form onSubmit={handleSubmit}>
-        <Field label={copy.missions.type}>
-          <Select value={type} onChange={(e) => setType(e.target.value)}>{MISSION_TYPES.map((t) => <option key={t}>{localizeMissionType(t, locale)}</option>)}</Select>
-        </Field>
-        <Field label={copy.missions.boat}>
-          <Select value={boatType} onChange={(e) => setBoatType(e.target.value)}>{BOAT_TYPES.map((t) => <option key={t}>{localizeBoatType(t, locale)}</option>)}</Select>
-        </Field>
-        <Field label={copy.missions.zone}>
-          <Select value={zone} onChange={(e) => setZone(e.target.value)}>{ZONES.map((z) => <option key={z}>{localizeZone(z, locale)}</option>)}</Select>
-        </Field>
-        <div className="grid grid-cols-2 gap-3">
-          <Field label={extra.missionsNew.departure}><TextInput required value={departure} onChange={(e) => setDeparture(e.target.value)} /></Field>
-          <Field label={extra.missionsNew.destination}><TextInput value={destination} onChange={(e) => setDestination(e.target.value)} /></Field>
+
+      <form onSubmit={handleSubmit} noValidate className="rounded-2xl border border-navy/[0.08] bg-white p-5 sm:p-6">
+        <div className="grid gap-x-4 sm:grid-cols-3">
+          <Field label={copy.missionForm.type}>
+            <Select value={type} onChange={(event) => { setType(event.target.value); if (isSingleDayMissionType(event.target.value)) setEndDate(''); }}>
+              {MISSION_TYPES.map((value) => <option key={value} value={value}>{localizeMissionType(copy, value)}</option>)}
+            </Select>
+          </Field>
+          <Field label={copy.missionForm.boat}>
+            <Select value={boatType} onChange={(event) => setBoatType(event.target.value)}>
+              {SKIPPER_BOAT_TYPES.map((value) => <option key={value} value={value}>{localizeBoatType(copy, value)}</option>)}
+            </Select>
+          </Field>
+          <Field label={copy.missionForm.zone}>
+            <Select value={zone} onChange={(event) => setZone(event.target.value)}>
+              {NAVIGATION_ZONES.map((value) => <option key={value} value={value}>{localizeZone(copy, value)}</option>)}
+            </Select>
+          </Field>
         </div>
-        <div className="grid grid-cols-2 gap-3">
-          <Field label={extra.missionsNew.startDate}><TextInput type="date" required value={startDate} onChange={(e) => setStartDate(e.target.value)} /></Field>
-          <Field label={extra.missionsNew.duration}><TextInput value={duration} onChange={(e) => setDuration(e.target.value)} /></Field>
+
+        <div className="grid gap-x-4 sm:grid-cols-2">
+          <Field label={copy.missionForm.departure}>
+            <TextInput required value={departure} maxLength={200} placeholder={copy.missionForm.departurePlaceholder} onChange={(event) => setDeparture(event.target.value)} />
+          </Field>
+          <Field label={copy.missionForm.destination} optionalLabel={copy.common.optional}>
+            <TextInput value={destination} maxLength={200} placeholder={copy.missionForm.destinationPlaceholder} onChange={(event) => setDestination(event.target.value)} />
+          </Field>
         </div>
-        <Field label={extra.missionsNew.compensation} hint={copy.missions.quote}>
-          <TextInput value={compensation} onChange={(e) => setCompensation(e.target.value)} />
+
+        {singleDay ? (
+          <Field label={copy.missionForm.date}>
+            <TextInput type="date" required min={today} value={startDate} onChange={(event) => setStartDate(event.target.value)} />
+          </Field>
+        ) : (
+          <div className="grid gap-x-4 sm:grid-cols-2">
+            <Field label={copy.missionForm.startDate}>
+              <TextInput type="date" required min={today} value={startDate} onChange={(event) => setStartDate(event.target.value)} />
+            </Field>
+            <Field label={copy.missionForm.endDate} optionalLabel={copy.common.optional}>
+              <TextInput type="date" min={startDate || today} value={endDate} onChange={(event) => setEndDate(event.target.value)} />
+            </Field>
+          </div>
+        )}
+
+        <Field label={copy.missionForm.hours} optionalLabel={copy.common.optional}>
+          <div className="relative">
+            <TextInput inputMode="decimal" value={hours} placeholder={copy.missionForm.hoursPlaceholder} onChange={(event) => setHours(event.target.value)} className="pe-20" />
+            <span className="pointer-events-none absolute inset-y-0 end-3 flex items-center text-sm text-gray-400">{copy.missionForm.hoursSuffix}</span>
+          </div>
         </Field>
-        <Field label={extra.missionsNew.requirements}>
-          <TextArea value={requirements} onChange={(e) => setRequirements(e.target.value)} />
+
+        <div className="mb-4">
+          <div className="grid gap-x-4 sm:grid-cols-[1fr_12rem]">
+            <Field label={copy.missionForm.compensation}>
+              <TextInput inputMode="decimal" value={amount} placeholder={copy.missionForm.amountPlaceholder} onChange={(event) => setAmount(event.target.value)} />
+            </Field>
+            <Field label={copy.missionForm.currency}>
+              <Select value={currency} onChange={(event) => setCurrency(event.target.value as MissionCurrency)}>
+                <option value="EUR">{copy.missionForm.currencies.EUR}</option>
+                <option value="USD">{copy.missionForm.currencies.USD}</option>
+              </Select>
+            </Field>
+          </div>
+          <label className="-mt-1 flex items-start gap-2.5 text-sm text-gray-700">
+            <input type="checkbox" checked={onQuote} onChange={(event) => setOnQuote(event.target.checked)} className="mt-0.5 h-4 w-4 accent-marine" />
+            <span>
+              <span className="font-semibold">{copy.missionForm.onQuote}</span>
+              <span className="block text-xs text-gray-500">{copy.missionForm.onQuoteHint}</span>
+            </span>
+          </label>
+        </div>
+
+        <Field label={copy.missionForm.permit} optionalLabel={copy.common.optional}>
+          <TextInput value={permit} maxLength={300} placeholder={copy.missionForm.permitPlaceholder} onChange={(event) => setPermit(event.target.value)} />
         </Field>
-        <Field label={extra.missionsNew.description}>
-          <TextArea value={description} onChange={(e) => setDescription(e.target.value)} />
+
+        <Field label={copy.missionForm.description}>
+          <TextArea value={description} rows={6} maxLength={5000} placeholder={copy.missionForm.descriptionPlaceholder} onChange={(event) => setDescription(event.target.value)} />
         </Field>
-        <Button type="submit" disabled={loading} className="w-full flex items-center justify-center gap-2 mt-2">
-          {loading && <Loader2 className="animate-spin" size={16} />} {copy.nav.publishMission}
-        </Button>
+
+        <div className="flex justify-end">
+          <Button type="submit" variant="mission" loading={loading} size="sm">
+            {copy.missionForm.submit}
+          </Button>
+        </div>
       </form>
     </main>
   );

@@ -4,18 +4,19 @@
 // En attendant, ce fichier suffit à typer proprement l'application.
 
 export type Role = 'skipper' | 'owner' | 'broker' | 'charter_company' | 'admin';
-export type MissionType = 'À la journée' | 'À la semaine' | 'Saisonnier' | 'Convoyage' | 'Autre';
+export type MissionType = 'À la journée' | 'À la semaine' | 'Saisonnier' | 'Convoyage' | 'Permanent' | 'Autre';
 export type MissionStatus = 'open' | 'assigned' | 'completed' | 'cancelled';
-export type ApplicationStatus = 'pending' | 'accepted' | 'rejected';
+export type ApplicationStatus = 'pending' | 'accepted' | 'rejected' | 'withdrawn';
+export type AvailabilityStatus = 'immediate' | 'season' | 'from_date' | 'range' | 'specific' | 'unavailable';
+export type MissionCurrency = 'EUR' | 'USD';
 export type NotificationType =
   | 'new_application'
   | 'application_accepted'
   | 'application_rejected'
+  | 'application_withdrawn'
   | 'mission_assigned'
   | 'mission_status_changed'
   | 'new_message';
-export type VerificationStatus = 'draft' | 'submitted' | 'approved' | 'rejected';
-export type VerificationDocType = 'identity' | 'license' | 'certificate' | 'company' | 'ownership' | 'mandate' | 'other';
 
 export interface ProfileCertification {
   name: string;
@@ -46,6 +47,7 @@ export interface Profile {
 
   // Champs "skipper"
   experience_years: number | null;
+  experience_range: string | null;
   zones: string[];
   boat_types: string[];
   languages: string[];
@@ -55,6 +57,8 @@ export interface Profile {
   gallery_urls: string[];
   hourly_rate: string | null;
   availability_note: string | null;
+  availability_status: AvailabilityStatus | null;
+  available_from: string | null;
   availability_slots?: AvailabilitySlot[];
   identity_verified: boolean;
   onboarding_step: 'role_details' | 'done' | null;
@@ -73,8 +77,13 @@ export interface Mission {
   departure: string;
   destination: string | null;
   start_date: string;
+  end_date: string | null;
   duration: string | null;
+  duration_hours: number | null;
   compensation: string | null;
+  compensation_amount: number | null;
+  currency: MissionCurrency;
+  on_quote: boolean;
   description: string | null;
   requirements: string | null;
   applicants_count: number;
@@ -90,6 +99,7 @@ export interface Application {
   phone: string | null;
   message: string | null;
   applied_at: string;
+  withdrawn_at: string | null;
   profiles?: Pick<Profile, 'id' | 'full_name'>;
   missions?: Mission;
 }
@@ -111,6 +121,33 @@ export interface Message {
   sender_id: string;
   text: string;
   created_at: string;
+  read_at: string | null;
+}
+
+/** Limited public information returned by the get_profile_cards() RPC. */
+export interface ProfileCard {
+  id: string;
+  role: Role;
+  full_name: string;
+  company_name: string | null;
+  avatar_url: string | null;
+}
+
+/** Row returned by the my_conversations() RPC. */
+export interface ConversationSummary {
+  conversation_id: string;
+  mission_id: string;
+  mission_departure: string;
+  mission_destination: string | null;
+  other_id: string;
+  other_role: Role;
+  other_name: string;
+  other_company: string | null;
+  other_avatar_url: string | null;
+  last_message: string | null;
+  last_message_at: string;
+  last_sender_id: string | null;
+  unread_count: number;
 }
 
 export interface Favorite {
@@ -139,31 +176,6 @@ export interface Notification {
   type: NotificationType;
   payload: Record<string, unknown>;
   read: boolean;
-  created_at: string;
-}
-
-export interface VerificationRequest {
-  id: string;
-  user_id: string;
-  status: VerificationStatus;
-  submitted_at: string | null;
-  reviewed_at: string | null;
-  reviewed_by: string | null;
-  rejection_reason: string | null;
-  created_at: string;
-  updated_at: string;
-  profiles?: Pick<Profile, 'id' | 'full_name' | 'role' | 'identity_verified'>;
-  verification_documents?: VerificationDocument[];
-}
-
-export interface VerificationDocument {
-  id: string;
-  request_id: string;
-  user_id: string;
-  doc_type: VerificationDocType;
-  storage_path: string;
-  original_filename: string | null;
-  mime_type: string | null;
   created_at: string;
 }
 

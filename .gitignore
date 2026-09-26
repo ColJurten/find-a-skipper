@@ -9,3 +9,7 @@ dist
 *.log
 supabase/.temp
 .vercel
+
+# env files (secrets)
+.env*
+!.env.local.example

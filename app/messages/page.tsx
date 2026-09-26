@@ -1,290 +1,301 @@
 'use client';
 
-import { Suspense, useEffect, useRef, useState } from 'react';
-import { useSearchParams } from 'next/navigation';
-import { Send, Loader2 } from 'lucide-react';
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import Link from 'next/link';
+import { useRouter, useSearchParams } from 'next/navigation';
+import { ArrowLeft, Loader2, Send } from 'lucide-react';
 import { useLocale } from '@/components/LocaleProvider';
-import { getExtraCopy } from '@/lib/i18n/extra';
+import { Avatar, CountBadge, EmptyState, ErrorBanner, LoadingState } from '@/components/ui';
 import { createClient } from '@/lib/supabase/client';
+import { refreshBadges } from '@/lib/badges';
 import { buildVerifyEmailPath, isEmailVerified } from '@/lib/auth';
-import { EmptyState, initials } from '@/components/ui';
-import type { Conversation, Message, Profile } from '@/lib/database.types';
+import { friendlyError } from '@/lib/errors';
+import { formatConversationStamp, formatDateTimeForLocale, interpolate } from '@/lib/i18n/format';
+import { localizeRole } from '@/lib/i18n/options';
+import { resolveAvatarUrls } from '@/lib/media';
+import { missionRoute } from '@/lib/mission';
+import type { ConversationSummary, Message } from '@/lib/database.types';
 
-function upsertMessage(prev: Message[], incoming: Message) {
-  if (prev.some((msg) => msg.id === incoming.id)) return prev;
-
-  const optimisticIndex = prev.findIndex(
-    (msg) => msg.id.startsWith('tmp-') && msg.sender_id === incoming.sender_id && msg.text === incoming.text
-  );
-
-  if (optimisticIndex >= 0) {
-    const next = [...prev];
-    next[optimisticIndex] = incoming;
+function upsertMessage(list: Message[], incoming: Message) {
+  if (list.some((message) => message.id === incoming.id)) return list;
+  const optimistic = list.findIndex((message) => message.id.startsWith('tmp-') && message.sender_id === incoming.sender_id && message.text === incoming.text);
+  if (optimistic >= 0) {
+    const next = [...list];
+    next[optimistic] = incoming;
     return next;
   }
+  return [...list, incoming].sort((left, right) => left.created_at.localeCompare(right.created_at));
+}
 
-  return [...prev, incoming];
+function conversationName(conversation: ConversationSummary) {
+  return conversation.other_role !== 'skipper' && conversation.other_company ? conversation.other_company : conversation.other_name;
 }
 
 function MessagesInner() {
   const params = useSearchParams();
+  const router = useRouter();
   const { copy, locale } = useLocale();
-  const extra = getExtraCopy(locale);
-  const preselected = params.get('conversation');
-
-  const [profile, setProfile] = useState<Profile | null>(null);
-  const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [activeId, setActiveId] = useState<string | null>(preselected);
+  const [userId, setUserId] = useState<string | null>(null);
+  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [avatars, setAvatars] = useState<Record<string, string | null>>({});
+  const [activeId, setActiveId] = useState<string | null>(params.get('conversation'));
   const [messages, setMessages] = useState<Message[]>([]);
   const [draft, setDraft] = useState('');
   const [loading, setLoading] = useState(true);
+  const [loadingThread, setLoadingThread] = useState(Boolean(params.get('conversation')));
   const [sending, setSending] = useState(false);
   const [error, setError] = useState('');
   const scrollRef = useRef<HTMLDivElement>(null);
-
-  const activeConversation = conversations.find((c) => c.id === activeId) || null;
-
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const activeIdRef = useRef<string | null>(activeId);
   useEffect(() => {
-    const supabase = createClient();
-    (async () => {
-      try {
-        const { data: { user } } = await supabase.auth.getUser();
-        if (!user) {
-          setLoading(false);
-          return;
-        }
-        if (!isEmailVerified(user)) {
-          setError(`${copy.verifyEmail.description} ${buildVerifyEmailPath(user.email || null, '/messages')}`);
-          return;
-        }
-
-        const { data: prof, error: profileError } = await supabase.from('profiles').select('*').eq('id', user.id).single();
-        if (profileError) {
-          setError(profileError.message);
-          return;
-        }
-
-        setProfile(prof as Profile);
-
-        const { data: convs, error: convError } = await supabase
-          .from('conversations')
-          .select('*, missions(departure, destination), demandeur:demandeur_id(full_name), skipper:skipper_id(full_name)')
-          .or(`demandeur_id.eq.${user.id},skipper_id.eq.${user.id}`)
-          .order('created_at', { ascending: false })
-          .limit(50);
-
-        if (convError) {
-          setError(convError.message);
-          return;
-        }
-
-        setConversations((convs as unknown as Conversation[]) || []);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : extra.errors.loadMessages);
-      } finally {
-        setLoading(false);
-      }
-    })();
-  }, [copy.verifyEmail.description, extra.errors.loadMessages]);
-
-  useEffect(() => {
-    if (!activeId || !profile) return;
-    const supabase = createClient();
-    (async () => {
-      const { data: conversation, error: conversationError } = await supabase
-        .from('conversations')
-        .select('id')
-        .eq('id', activeId)
-        .or(`demandeur_id.eq.${profile.id},skipper_id.eq.${profile.id}`)
-        .maybeSingle();
-
-      if (conversationError || !conversation) {
-        setError(conversationError?.message || copy.messages.stale);
-        setActiveId(null);
-        setMessages([]);
-        return;
-      }
-
-      const { data: msgs, error: msgError } = await supabase
-        .from('messages')
-        .select('*')
-        .eq('conversation_id', activeId)
-        .order('created_at', { ascending: true });
-
-      if (msgError) {
-        setError(msgError.message);
-        return;
-      }
-
-      setError('');
-      setMessages((msgs as Message[]) || []);
-    })();
-
-    const channel = supabase
-      .channel(`conv-${activeId}`)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `conversation_id=eq.${activeId}` }, (payload) => {
-        setMessages((prev) => upsertMessage(prev, payload.new as Message));
-      })
-      .subscribe();
-
-    return () => { supabase.removeChannel(channel); };
-  }, [activeId, copy.messages.stale, profile]);
-
-  useEffect(() => {
-    const url = new URL(window.location.href);
-    if (activeId) {
-      url.searchParams.set('conversation', activeId);
-    } else {
-      url.searchParams.delete('conversation');
-    }
-    window.history.replaceState({}, '', `${url.pathname}${url.search}`);
+    activeIdRef.current = activeId;
   }, [activeId]);
 
-  useEffect(() => { scrollRef.current?.scrollTo(0, scrollRef.current.scrollHeight); }, [messages]);
+  const active = useMemo(() => conversations.find((conversation) => conversation.conversation_id === activeId) || null, [conversations, activeId]);
 
-  async function sendMessage(e: React.FormEvent) {
-    e.preventDefault();
-    if (!draft.trim() || !activeId || !profile) return;
+  const loadConversations = useCallback(async () => {
     const supabase = createClient();
-    const text = draft.trim();
-    setSending(true);
-    setError('');
-
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user || !isEmailVerified(user)) {
-      setSending(false);
-      setError(copy.messages.verifyFirst);
+    const { data, error: rpcError } = await supabase.rpc('my_conversations');
+    if (rpcError) {
+      setError(friendlyError(copy, rpcError));
       return;
     }
-
-    const { data: conversation, error: conversationError } = await supabase
-      .from('conversations')
-      .select('id')
-      .eq('id', activeId)
-      .or(`demandeur_id.eq.${profile.id},skipper_id.eq.${profile.id}`)
-      .maybeSingle();
-
-    if (conversationError || !conversation) {
-      setSending(false);
-      setError(conversationError?.message || copy.messages.stale);
-      return;
+    const rows = (data as ConversationSummary[]) || [];
+    setConversations(rows);
+    // A conversation that is not (or no longer) accessible cannot stay open.
+    if (activeIdRef.current && !rows.some((row) => row.conversation_id === activeIdRef.current)) {
+      setError(copy.messaging.stale);
+      setActiveId(null);
     }
+    setAvatars(await resolveAvatarUrls(supabase, rows.map((row) => ({ id: row.other_id, avatar_url: row.other_avatar_url }))));
+  }, [copy]);
 
-    const optimisticId = `tmp-${Date.now()}`;
-    const optimisticMessage: Message = {
-      id: optimisticId,
-      conversation_id: activeId,
-      sender_id: profile.id,
-      text,
-      created_at: new Date().toISOString(),
-    };
-
-    setMessages((prev) => [...prev, optimisticMessage]);
-    setDraft('');
-    const { data: insertedMessage, error: insertError } = await supabase
-      .from('messages')
-      .insert({ conversation_id: activeId, sender_id: profile.id, text })
-      .select('*')
-      .single();
-
-    setSending(false);
-
-    if (insertError) {
-      setError(insertError.message);
-      setMessages((prev) => prev.filter((msg) => msg.id !== optimisticId));
-      setDraft(text);
-      return;
-    }
-
-    if (insertedMessage) {
-      setMessages((prev) => upsertMessage(prev.filter((msg) => msg.id !== optimisticId), insertedMessage as Message));
-    }
+  function selectConversation(conversationId: string | null) {
+    if (conversationId === activeId) return;
+    setMessages([]);
+    setLoadingThread(Boolean(conversationId));
+    setActiveId(conversationId);
   }
 
-  if (loading) return <div className="flex items-center gap-2 py-16 justify-center text-gray-500"><Loader2 className="animate-spin" size={20} /> {copy.common.loading}</div>;
-  if (!profile) return <main className="max-w-md mx-auto px-6 py-10"><p>{copy.messages.connect}</p></main>;
+  const markRead = useCallback(async (conversationId: string) => {
+    const supabase = createClient();
+    await supabase.rpc('mark_conversation_read', { p_conversation_id: conversationId });
+    setConversations((current) => current.map((row) => (row.conversation_id === conversationId ? { ...row, unread_count: 0 } : row)));
+    refreshBadges();
+  }, []);
+
+  // Initial load + realtime subscription for every conversation of the user.
+  useEffect(() => {
+    const supabase = createClient();
+    let channel: ReturnType<typeof supabase.channel> | null = null;
+    (async () => {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) {
+        router.replace('/login?next=/messages');
+        return;
+      }
+      if (!isEmailVerified(user)) {
+        router.replace(buildVerifyEmailPath(user.email || null, '/messages'));
+        return;
+      }
+      setUserId(user.id);
+      await loadConversations();
+      setLoading(false);
+
+      channel = supabase
+        .channel(`messaging-${user.id}`)
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (payload) => {
+          const incoming = payload.new as Message;
+          if (incoming.conversation_id === activeIdRef.current) {
+            setMessages((current) => upsertMessage(current, incoming));
+            if (incoming.sender_id !== user.id) void markRead(incoming.conversation_id);
+          }
+          void loadConversations();
+        })
+        .subscribe();
+    })();
+    return () => {
+      if (channel) supabase.removeChannel(channel);
+    };
+  }, [loadConversations, markRead, router]);
+
+  // Load the selected conversation.
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (activeId) url.searchParams.set('conversation', activeId);
+    else url.searchParams.delete('conversation');
+    window.history.replaceState({}, '', `${url.pathname}${url.search}`);
+
+    if (!activeId || !userId) return;
+    let cancelled = false;
+    const supabase = createClient();
+    (async () => {
+      const { data, error: fetchError } = await supabase.from('messages').select('*').eq('conversation_id', activeId).order('created_at', { ascending: true });
+      if (cancelled) return;
+      setLoadingThread(false);
+      if (fetchError) {
+        setError(friendlyError(copy, fetchError));
+        return;
+      }
+      setError('');
+      setMessages((data as Message[]) || []);
+      void markRead(activeId);
+      inputRef.current?.focus();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeId, userId, copy, markRead]);
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+  }, [messages]);
+
+  async function sendMessage(event?: React.FormEvent) {
+    event?.preventDefault();
+    const text = draft.trim();
+    if (!text || !activeId || !userId || sending) return;
+    setSending(true);
+    setError('');
+    const optimistic: Message = { id: `tmp-${Date.now()}`, conversation_id: activeId, sender_id: userId, text, created_at: new Date().toISOString(), read_at: null };
+    // The message appears immediately and the user stays in the conversation.
+    setMessages((current) => [...current, optimistic]);
+    setDraft('');
+    const supabase = createClient();
+    const { data, error: insertError } = await supabase.from('messages').insert({ conversation_id: activeId, sender_id: userId, text }).select('*').single();
+    setSending(false);
+    if (insertError) {
+      setMessages((current) => current.filter((message) => message.id !== optimistic.id));
+      setDraft(text);
+      setError(friendlyError(copy, insertError));
+      return;
+    }
+    setMessages((current) => upsertMessage(current, data as Message));
+    setConversations((current) => {
+      const updated = current.map((row) => (row.conversation_id === activeId ? { ...row, last_message: text, last_message_at: (data as Message).created_at, last_sender_id: userId } : row));
+      return updated.sort((left, right) => right.last_message_at.localeCompare(left.last_message_at));
+    });
+    inputRef.current?.focus();
+  }
+
+  if (loading) return <LoadingState label={copy.common.loading} />;
 
   return (
-    <main className="max-w-4xl mx-auto px-6 py-10">
-      <h1 className="font-display text-3xl font-bold mb-6">{copy.messages.title}</h1>
-      {error && (
-        <div className="rounded-2xl p-5 mb-6 bg-white border border-red-200 text-sm text-red-700">
-          {error}
-        </div>
-      )}
+    <main className="mx-auto max-w-6xl px-0 py-0 sm:px-6 sm:py-8">
+      <h1 className="font-display mb-4 hidden text-3xl font-bold text-marine sm:block">{copy.messaging.title}</h1>
+      <div className="px-4 sm:px-0"><ErrorBanner message={error} /></div>
+
       {conversations.length === 0 ? (
-        <EmptyState text={copy.messages.empty} />
+        <div className="px-4 py-8 sm:px-0 sm:py-0">
+          <EmptyState text={copy.messaging.empty} />
+        </div>
       ) : (
-        <div className="rounded-2xl overflow-hidden bg-white border border-navy/[0.08] min-h-[440px] md:grid" style={{ gridTemplateColumns: '260px 1fr' }}>
-          <div className={`border-r border-navy/[0.08] ${activeId ? 'hidden md:block' : 'block'}`}>
-            {conversations.map((c) => {
-              const otherName = profile.role === 'skipper' ? c.demandeur?.full_name : c.skipper?.full_name;
-              return (
-                <button
-                  key={c.id}
-                  onClick={() => setActiveId(c.id)}
-                  className={`w-full text-left p-4 flex gap-3 items-start border-b border-navy/[0.06] ${activeId === c.id ? 'bg-lightblue' : ''}`}
-                >
-                  <div className="w-9 h-9 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0 bg-navy text-white">
-                    {initials(otherName || '')}
-                  </div>
-                  <div className="min-w-0">
-                    <div className="font-semibold text-sm truncate">{otherName}</div>
-                    <div className="text-xs truncate text-gray-500">
-                      {c.missions?.departure}{c.missions?.destination ? ` → ${c.missions.destination}` : ''}
-                    </div>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-          <div className={`flex flex-col ${activeId ? 'block' : 'hidden md:flex'}`}>
-            {!activeId ? (
-              <div className="flex-1 flex items-center justify-center text-sm text-gray-500">{copy.messages.select}</div>
+        <div className="flex h-[calc(100svh-73px)] overflow-hidden border-navy/[0.08] bg-white sm:h-[calc(100svh-220px)] sm:min-h-[520px] sm:rounded-2xl sm:border">
+          {/* Conversation list (left) */}
+          <aside className={`w-full shrink-0 flex-col border-e border-navy/[0.08] md:flex md:w-80 ${activeId ? 'hidden' : 'flex'}`}>
+            <div className="border-b border-navy/[0.08] px-4 py-3 sm:hidden">
+              <h1 className="font-display text-xl font-bold text-marine">{copy.messaging.title}</h1>
+            </div>
+            <ul className="flex-1 overflow-y-auto">
+              {conversations.map((conversation) => {
+                const name = conversationName(conversation);
+                const mine = conversation.last_sender_id === userId;
+                const selected = conversation.conversation_id === activeId;
+                return (
+                  <li key={conversation.conversation_id}>
+                    <button
+                      type="button"
+                      onClick={() => selectConversation(conversation.conversation_id)}
+                      className={`flex w-full items-center gap-3 border-b border-navy/[0.05] px-4 py-3 text-start transition ${selected ? 'bg-lightblue' : 'hover:bg-offwhite'}`}
+                    >
+                      <Avatar name={name} url={avatars[conversation.other_id]} size={48} />
+                      <span className="min-w-0 flex-1">
+                        <span className="flex items-baseline justify-between gap-2">
+                          <span className="truncate font-bold text-anthracite">{name}</span>
+                          <span className={`shrink-0 text-[11px] ${conversation.unread_count ? 'font-semibold text-emerald-700' : 'text-gray-400'}`}>
+                            {formatConversationStamp(conversation.last_message_at, locale)}
+                          </span>
+                        </span>
+                        <span className="mt-0.5 flex items-center justify-between gap-2">
+                          <span className="truncate text-sm font-normal text-gray-600">
+                            {conversation.last_message ? `${mine ? copy.messaging.you : ''}${conversation.last_message}` : interpolate(copy.messaging.mission, { route: missionRoute({ departure: conversation.mission_departure, destination: conversation.mission_destination }) })}
+                          </span>
+                          <CountBadge count={conversation.unread_count} label={interpolate(copy.messaging.unread, { count: conversation.unread_count })} />
+                        </span>
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </aside>
+
+          {/* Conversation (right) */}
+          <section className={`min-w-0 flex-1 flex-col ${activeId ? 'flex' : 'hidden md:flex'}`}>
+            {!active ? (
+              <div className="flex flex-1 items-center justify-center p-6 text-sm text-gray-500">{copy.messaging.select}</div>
             ) : (
               <>
-                <div className="px-4 py-3 border-b border-navy/[0.08] md:hidden">
-                  <button
-                    type="button"
-                    onClick={() => setActiveId(null)}
-                    className="text-sm font-semibold text-navy"
-                  >
-                    {copy.messages.back}
+                <header className="flex items-center gap-3 border-b border-navy/[0.08] px-3 py-2.5 sm:px-4">
+                  <button type="button" onClick={() => selectConversation(null)} className="rounded-lg p-2 text-marine hover:bg-lightblue md:hidden" aria-label={copy.messaging.back}>
+                    <ArrowLeft size={18} className="rtl:rotate-180" />
                   </button>
-                  <div className="text-xs text-gray-500 mt-1 truncate">
-                    {activeConversation?.missions?.departure}
-                    {activeConversation?.missions?.destination
-                      ? ` → ${activeConversation.missions.destination}`
-                      : ''}
+                  <Avatar name={conversationName(active)} url={avatars[active.other_id]} size={40} />
+                  <div className="min-w-0">
+                    <p className="truncate font-bold">{conversationName(active)}</p>
+                    <Link href={`/missions/${active.mission_id}`} className="block truncate text-xs text-gray-500 hover:text-marine hover:underline">
+                      {localizeRole(copy, active.other_role)} · {interpolate(copy.messaging.mission, { route: missionRoute({ departure: active.mission_departure, destination: active.mission_destination }) })}
+                    </Link>
                   </div>
-                </div>
-                <div ref={scrollRef} className="flex-1 p-4 space-y-3 overflow-y-auto max-h-[55vh] md:max-h-[380px]">
-                  {messages.length === 0 && <p className="text-sm text-center text-gray-500">{copy.messages.first}</p>}
-                  {messages.map((m) => {
-                    const mine = m.sender_id === profile.id;
-                    return (
-                      <div key={m.id} className={`flex ${mine ? 'justify-end' : 'justify-start'}`}>
-                        <div className={`max-w-[75%] px-3.5 py-2.5 rounded-2xl text-sm ${mine ? 'bg-navy text-white' : 'bg-lightblue text-anthracite'}`}>
-                          {m.text}
+                </header>
+
+                <div ref={scrollRef} className="flex-1 space-y-2 overflow-y-auto bg-[linear-gradient(180deg,#f4f8fc_0%,#fafcfe_100%)] px-3 py-4 sm:px-6">
+                  {loadingThread ? (
+                    <div className="flex justify-center py-10 text-gray-400"><Loader2 className="animate-spin" size={20} /></div>
+                  ) : messages.length === 0 ? (
+                    <p className="py-10 text-center text-sm text-gray-500">{copy.messaging.first}</p>
+                  ) : (
+                    messages.map((message) => {
+                      const mine = message.sender_id === userId;
+                      return (
+                        <div key={message.id} className={`flex ${mine ? 'justify-end' : 'justify-start'}`}>
+                          <div className={`max-w-[80%] rounded-2xl px-3.5 py-2 text-[15px] shadow-sm sm:max-w-[70%] ${mine ? 'rounded-ee-md bg-marine text-white' : 'rounded-es-md bg-white text-anthracite'} ${message.id.startsWith('tmp-') ? 'opacity-70' : ''}`}>
+                            <p dir="auto" className="whitespace-pre-wrap break-words">{message.text}</p>
+                            <p className={`mt-0.5 text-end text-[10px] ${mine ? 'text-white/70' : 'text-gray-400'}`}>
+                              {formatDateTimeForLocale(message.created_at, locale, { hour: '2-digit', minute: '2-digit' })}
+                            </p>
+                          </div>
                         </div>
-                      </div>
-                    );
-                  })}
+                      );
+                    })
+                  )}
                 </div>
-                <form onSubmit={sendMessage} className="p-3 flex gap-2 border-t border-navy/[0.08]">
-                  <input
+
+                <form onSubmit={sendMessage} className="flex items-end gap-2 border-t border-navy/[0.08] p-2.5 sm:p-3">
+                  <textarea
+                    ref={inputRef}
+                    rows={1}
                     value={draft}
-                    onChange={(e) => setDraft(e.target.value)}
-                    placeholder={copy.messages.placeholder}
-                    className="flex-1 text-sm border border-gray-200 rounded-[10px] px-3.5 py-2.5 outline-none"
+                    maxLength={4000}
+                    onChange={(event) => setDraft(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+                        event.preventDefault();
+                        void sendMessage();
+                      }
+                    }}
+                    placeholder={copy.messaging.placeholder}
+                    aria-label={copy.messaging.placeholder}
+                    className="max-h-32 min-h-[44px] flex-1 resize-none rounded-2xl border border-gray-200 bg-white px-4 py-2.5 text-[15px] outline-none focus:border-navy focus:ring-2 focus:ring-navy/15"
                   />
-                  <button type="submit" disabled={!draft.trim() || sending} className="flex items-center justify-center rounded-lg px-4 bg-navy text-white">
-                    {sending ? <Loader2 className="animate-spin" size={16} /> : <Send size={16} />}
+                  <button type="submit" disabled={!draft.trim() || sending} aria-label={copy.messaging.send} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-marine text-white transition disabled:opacity-40">
+                    {sending ? <Loader2 className="animate-spin" size={18} /> : <Send size={18} className="rtl:-scale-x-100" />}
                   </button>
                 </form>
               </>
             )}
-          </div>
+          </section>
         </div>
       )}
     </main>
@@ -294,7 +305,7 @@ function MessagesInner() {
 export default function MessagesPage() {
   const { copy } = useLocale();
   return (
-    <Suspense fallback={<div className="flex items-center gap-2 py-16 justify-center text-gray-500"><Loader2 className="animate-spin" size={20} /> {copy.common.loading}</div>}>
+    <Suspense fallback={<LoadingState label={copy.common.loading} />}>
       <MessagesInner />
     </Suspense>
   );
