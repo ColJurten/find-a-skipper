@@ -12,3 +12,18 @@
 .fade-in-3 { animation-delay: .25s; }
 .lift-card { transition: transform .2s ease, box-shadow .2s ease; }
 .lift-card:hover { transform: translateY(-4px); box-shadow: 0 14px 30px rgba(11,37,69,0.1); }
+
+/* Arabic: dedicated Arabic font first (the Latin fallback fonts contain poor Arabic glyphs),
+   no letter-spacing (it breaks joined letters) and a slightly larger line height. */
+html[lang='ar'] body,
+html[lang='ar'] .font-display,
+html[lang='ar'] input,
+html[lang='ar'] textarea,
+html[lang='ar'] select,
+html[lang='ar'] button { font-family: var(--font-arabic), system-ui, sans-serif; }
+html[lang='ar'] * { letter-spacing: normal !important; }
+html[lang='ar'] body { line-height: 1.7; }
+
+@media (prefers-reduced-motion: reduce) {
+  .fade-in, .lift-card { animation: none; transition: none; }
+}

@@ -10,6 +10,7 @@ const VERIFIED_EMAIL_REQUIRED_PATHS = [
   '/my-missions',
   '/my-applications',
   '/account',
+  '/skippers',
 ];
 
 export function safeNextPath(nextPath: string | null | undefined, fallback: string) {

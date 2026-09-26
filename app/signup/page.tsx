@@ -3,21 +3,25 @@
 import { Suspense, useState } from 'react';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { Anchor, Briefcase, Building2, Ship as ShipIcon, Loader2 } from 'lucide-react';
+import { Anchor, Briefcase, Building2, Ship as ShipIcon } from 'lucide-react';
 import BrandLogo from '@/components/BrandLogo';
 import { useLocale } from '@/components/LocaleProvider';
-import { getExtraCopy } from '@/lib/i18n/extra';
-import { createClient } from '@/lib/supabase/client';
-import { Field, TextInput, TextArea, Button, ErrorBanner } from '@/components/ui';
+import { Button, ErrorBanner, Field, FieldGroup, Select, TextArea, TextInput } from '@/components/ui';
+import AvailabilityEditor from '@/components/availability-editor';
 import CertificationSelect from '@/components/certification-select';
-import LanguageSelect from '@/components/language-select';
+import LanguageCheckboxes from '@/components/language-checkboxes';
 import MultiSelectTags from '@/components/multi-select-tags';
 import PasswordInput from '@/components/password-input';
 import PhoneInput from '@/components/phone-input';
+import PhotoPicker from '@/components/photo-picker';
+import { createClient } from '@/lib/supabase/client';
 import { buildEmailRedirectTo, buildVerifyEmailPath } from '@/lib/auth';
-import { localizeRole } from '@/lib/i18n/options';
+import { emptyAvailability, slotsForStatus, validateAvailability } from '@/lib/availability';
+import { friendlyError } from '@/lib/errors';
+import { localizeBoatType, localizeRole, localizeZone } from '@/lib/i18n/options';
+import { prepareAvatar, stashPendingAvatar, uploadAvatar } from '@/lib/pending-avatar';
 import { createEmptyPhoneValue, getPhoneStorageValue, validatePhoneValue } from '@/lib/phone';
-import { DEFAULT_INDICATIVE_RATE, NAVIGATION_ZONES, SKIPPER_BOAT_TYPES } from '@/lib/profile-options';
+import { EXPERIENCE_RANGES, NAVIGATION_ZONES, SKIPPER_BOAT_TYPES } from '@/lib/profile-options';
 import type { Role } from '@/lib/database.types';
 
 const ROLE_OPTIONS: { value: Role; icon: typeof Anchor }[] = [
@@ -27,26 +31,17 @@ const ROLE_OPTIONS: { value: Role; icon: typeof Anchor }[] = [
   { value: 'charter_company', icon: ShipIcon },
 ];
 
-function normalizeHttpsUrl(value: string) {
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  try {
-    const parsed = new URL(trimmed);
-    if (parsed.protocol !== 'https:') return null;
-    return parsed.toString();
-  } catch {
-    return null;
-  }
+function isSignupRole(value: string | null): value is Role {
+  return value === 'skipper' || value === 'owner' || value === 'broker' || value === 'charter_company';
 }
 
 function SignupForm() {
   const router = useRouter();
   const params = useSearchParams();
-  const { copy, locale } = useLocale();
-  const extra = getExtraCopy(locale);
-  const initialRole = (params.get('role') as Role) || 'skipper';
+  const { copy } = useLocale();
+  const requestedRole = params.get('role');
 
-  const [role, setRole] = useState<Role>(initialRole);
+  const [role, setRole] = useState<Role>(isSignupRole(requestedRole) ? requestedRole : 'skipper');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -55,229 +50,235 @@ function SignupForm() {
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [phone, setPhone] = useState(createEmptyPhoneValue('FR'));
-  // skipper fields
-  const [experienceYears, setExperienceYears] = useState('');
+  const [photo, setPhoto] = useState<File | null>(null);
+  const [languages, setLanguages] = useState<string[]>([]);
+  const [acceptedLegal, setAcceptedLegal] = useState(false);
+  // Skipper
+  const [experienceRange, setExperienceRange] = useState('');
   const [zones, setZones] = useState<string[]>([]);
   const [boatTypes, setBoatTypes] = useState<string[]>([]);
-  const [languages, setLanguages] = useState<string[]>([]);
   const [permits, setPermits] = useState('');
-  const [avatarUrl, setAvatarUrl] = useState('');
-  const [hourlyRate, setHourlyRate] = useState(DEFAULT_INDICATIVE_RATE);
-  const [availabilityNote, setAvailabilityNote] = useState('');
+  const [certifications, setCertifications] = useState<string[]>([]);
+  const [availability, setAvailability] = useState(emptyAvailability());
   const [bio, setBio] = useState('');
-  const [selectedCertifications, setSelectedCertifications] = useState<string[]>([]);
-  const [acceptedLegal, setAcceptedLegal] = useState(false);
-  // demandeur fields
+  // Owner / broker / agency
   const [companyName, setCompanyName] = useState('');
   const [fleetSize, setFleetSize] = useState('');
   const [city, setCity] = useState('');
 
-  function toggle(list: string[], setList: (v: string[]) => void, value: string) {
-    setList(list.includes(value) ? list.filter((v) => v !== value) : [...list, value]);
+  const isSkipper = role === 'skipper';
+  const isCompany = role === 'broker' || role === 'charter_company';
+
+  function toggle(list: string[], setList: (value: string[]) => void, value: string) {
+    setList(list.includes(value) ? list.filter((entry) => entry !== value) : [...list, value]);
   }
 
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
+  function validate(): string | null {
+    if (!fullName.trim() || !email.trim() || !password || !confirmPassword || (isCompany && !companyName.trim())) return copy.signup.errors.requiredFields;
+    if (password.length < 10) return copy.signup.errors.passwordLength;
+    if (password !== confirmPassword) return copy.signup.errors.passwordMismatch;
+    const phoneError = validatePhoneValue(phone, false);
+    if (phoneError) return copy.phone[phoneError];
+    if (isSkipper) {
+      if (languages.length === 0) return copy.signup.errors.languagesRequired;
+      const availabilityError = validateAvailability(availability);
+      if (availabilityError) return copy.availability.errors[availabilityError];
+    }
+    if (!acceptedLegal) return copy.signup.errors.acceptLegal;
+    return null;
+  }
+
+  async function handleSubmit(event: React.FormEvent) {
+    event.preventDefault();
     setError('');
-    if (!fullName || !email || !password || !confirmPassword) {
-      setError(copy.verifyEmail.invalidEmail);
-      return;
-    }
-
-    if (password.length < 10) {
-      setError(copy.common.password);
-      return;
-    }
-
-    if (password !== confirmPassword) {
-      setError(copy.common.confirmPassword);
-      return;
-    }
-
-    if (!acceptedLegal) {
-      setError(`${copy.signup.legalIntro} CGU ${copy.signup.legalAnd} ${copy.signup.legalPrivacy}.`);
-      return;
-    }
-
-    const phoneError = validatePhoneValue(phone, false, locale);
-    if (phoneError) {
-      setError(phoneError);
-      return;
-    }
-
-    const normalizedAvatarUrl = normalizeHttpsUrl(avatarUrl);
-    if (role === 'skipper' && avatarUrl.trim() && !normalizedAvatarUrl) {
-      setError(extra.profile.photoHttps);
+    const validationError = validate();
+    if (validationError) {
+      setError(validationError);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
       return;
     }
 
     setLoading(true);
     const supabase = createClient();
-    const { data, error: signErr } = await supabase.auth.signUp({
-      email,
+    const { data, error: signUpError } = await supabase.auth.signUp({
+      email: email.trim(),
       password,
       options: {
         emailRedirectTo: buildEmailRedirectTo(window.location.origin, '/dashboard'),
         data: {
           role,
-          full_name: fullName,
+          full_name: fullName.trim(),
           phone: getPhoneStorageValue(phone) || null,
-          company_name: role === 'broker' || role === 'charter_company' ? companyName : null,
-          fleet_size: role === 'broker' || role === 'charter_company' ? fleetSize : null,
-          city: role === 'owner' ? city : null,
-          experience_years: role === 'skipper' ? experienceYears : null,
-          zones: role === 'skipper' ? zones : [],
-          boat_types: role === 'skipper' ? boatTypes : [],
-          languages: role === 'skipper' ? languages : [],
-          permits: role === 'skipper' ? permits : null,
-          avatar_url: role === 'skipper' ? normalizedAvatarUrl : null,
-          hourly_rate: role === 'skipper' ? hourlyRate : null,
-          availability_note: role === 'skipper' ? availabilityNote : null,
-          certifications: role === 'skipper' ? selectedCertifications.map((name) => ({ name, verified: false })) : [],
-          bio: role === 'skipper' ? bio : null,
+          languages,
+          company_name: isCompany ? companyName.trim() : null,
+          fleet_size: isCompany && fleetSize ? fleetSize : null,
+          city: role === 'owner' ? city.trim() || null : null,
+          experience_range: isSkipper ? experienceRange || null : null,
+          zones: isSkipper ? zones : [],
+          boat_types: isSkipper ? boatTypes : [],
+          permits: isSkipper ? permits.trim() || null : null,
+          certifications: isSkipper ? certifications.map((name) => ({ name, verified: false })) : [],
+          availability_status: isSkipper ? availability.status : null,
+          available_from: isSkipper && availability.status === 'from_date' ? availability.fromDate : null,
+          availability_slots: isSkipper ? slotsForStatus(availability).map(({ start_date, end_date }) => ({ start_date, end_date })) : [],
+          availability_note: isSkipper ? availability.note.trim() || null : null,
+          bio: isSkipper ? bio.trim() || null : null,
         },
       },
     });
-    setLoading(false);
-    if (signErr) {
-      if (/fetch|network|Failed to fetch/i.test(signErr.message)) {
-        setError(copy.login.unavailable);
-      } else {
-        setError(signErr.message);
-      }
+
+    if (signUpError) {
+      setLoading(false);
+      setError(friendlyError(copy, signUpError));
       return;
     }
+    // Supabase hides existing accounts behind a user without identities.
+    if (data.user && Array.isArray(data.user.identities) && data.user.identities.length === 0) {
+      setLoading(false);
+      setError(copy.errors.userExists);
+      return;
+    }
+
+    let photoPending = false;
+    if (photo) {
+      const prepared = await prepareAvatar(photo);
+      if (data.session && data.user) {
+        try {
+          await uploadAvatar(supabase, data.user.id, prepared);
+        } catch {
+          photoPending = await stashPendingAvatar(email, prepared);
+        }
+      } else {
+        photoPending = await stashPendingAvatar(email, prepared);
+      }
+    }
+
+    setLoading(false);
     if (data.session) {
       router.push('/dashboard');
       router.refresh();
-    } else {
-      router.replace(buildVerifyEmailPath(email, '/dashboard'));
+      return;
     }
+    const verifyPath = buildVerifyEmailPath(email.trim(), '/dashboard');
+    router.replace(photoPending ? `${verifyPath}&photo=pending` : verifyPath);
   }
-
-  const isDemandeur = role !== 'skipper';
 
   return (
     <>
       <ErrorBanner message={error} />
 
-      <div className="grid grid-cols-2 gap-2 mb-6">
-        {ROLE_OPTIONS.map(({ value, icon: Icon }) => (
-          <button
-            key={value}
-            type="button"
-            onClick={() => setRole(value)}
-            className={`flex items-center gap-2 p-3 rounded-xl justify-center text-sm font-semibold border-[1.5px] ${
-              role === value ? 'bg-navy text-white border-navy' : 'bg-white text-anthracite border-gray-200'
-            }`}
-          >
-            <Icon size={15} /> {localizeRole(value, locale)}
-          </button>
-        ))}
-      </div>
+      <FieldGroup label={copy.signup.chooseRole}>
+        <div className="grid grid-cols-2 gap-2">
+          {ROLE_OPTIONS.map(({ value, icon: Icon }) => (
+            <button
+              key={value}
+              type="button"
+              aria-pressed={role === value}
+              onClick={() => setRole(value)}
+              className={`flex min-h-[48px] items-center justify-center gap-2 rounded-xl border px-3 py-2.5 text-center text-sm font-semibold transition ${
+                role === value ? 'border-marine bg-marine text-white' : 'border-gray-200 bg-white text-anthracite hover:border-marine/40'
+              }`}
+            >
+              <Icon size={15} className="shrink-0" /> {localizeRole(copy, value)}
+            </button>
+          ))}
+        </div>
+      </FieldGroup>
 
-      <form onSubmit={handleSubmit}>
-        <Field label={role === 'skipper' ? copy.signup.fullName : copy.signup.contactName}>
-          <TextInput required value={fullName} onChange={(e) => setFullName(e.target.value)} />
+      <form onSubmit={handleSubmit} noValidate>
+        <FieldGroup label={copy.photo.label}>
+          <PhotoPicker name={fullName} file={photo} onChange={setPhoto} onError={setError} />
+        </FieldGroup>
+
+        <Field label={isSkipper ? copy.signup.fullName : copy.signup.contactName}>
+          <TextInput required autoComplete="name" value={fullName} onChange={(event) => setFullName(event.target.value)} />
         </Field>
 
-        {(role === 'broker' || role === 'charter_company') && (
+        {isCompany && (
           <>
             <Field label={copy.signup.companyName}>
-              <TextInput required value={companyName} onChange={(e) => setCompanyName(e.target.value)} />
+              <TextInput required autoComplete="organization" value={companyName} onChange={(event) => setCompanyName(event.target.value)} />
             </Field>
-            <Field label={copy.signup.fleetSize}>
-              <TextInput type="number" min="0" value={fleetSize} onChange={(e) => setFleetSize(e.target.value)} />
+            <Field label={copy.signup.fleetSize} optionalLabel={copy.common.optional}>
+              <TextInput type="number" min="0" inputMode="numeric" value={fleetSize} onChange={(event) => setFleetSize(event.target.value)} />
             </Field>
           </>
         )}
         {role === 'owner' && (
-          <Field label={copy.signup.city}>
-            <TextInput value={city} onChange={(e) => setCity(e.target.value)} />
+          <Field label={copy.signup.city} optionalLabel={copy.common.optional}>
+            <TextInput autoComplete="address-level2" value={city} onChange={(event) => setCity(event.target.value)} />
           </Field>
         )}
 
         <Field label={copy.common.email}>
-          <TextInput type="email" required value={email} onChange={(e) => setEmail(e.target.value)} />
+          <TextInput type="email" required autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} />
         </Field>
-        <Field label={copy.common.password}>
-          <PasswordInput required minLength={10} value={password} onChange={(e) => setPassword(e.target.value)} />
+        <Field label={copy.common.password} hint={copy.signup.passwordHint}>
+          <PasswordInput required minLength={10} autoComplete="new-password" value={password} onChange={(event) => setPassword(event.target.value)} />
         </Field>
         <Field label={copy.common.confirmPassword}>
-          <PasswordInput required minLength={10} value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} />
+          <PasswordInput required minLength={10} autoComplete="new-password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} />
         </Field>
-        <Field label={copy.common.phone}>
+        <FieldGroup label={copy.common.phone}>
           <PhoneInput value={phone} onChange={setPhone} />
-        </Field>
+        </FieldGroup>
 
-        <label className="flex items-start gap-2.5 mb-4">
-          <input
-            type="checkbox"
-            checked={acceptedLegal}
-            onChange={(event) => setAcceptedLegal(event.target.checked)}
-            className="mt-1"
-            required
-          />
-          <span className="text-sm text-gray-600 leading-6">
-            {copy.signup.legalIntro}{' '}
-            <Link href="/cgu" className="font-semibold text-navy underline">
-              CGU
-            </Link>{' '}{copy.signup.legalAnd}{' '}
-            <Link href="/confidentialite" className="font-semibold text-navy underline">
-              {copy.signup.legalPrivacy}
-            </Link>
-            . {copy.signup.legalRead}{' '}
-            <Link href="/cookies" className="font-semibold text-navy underline">
-              {copy.signup.legalCookies}
-            </Link>
-            .
-          </span>
-        </label>
+        <FieldGroup label={copy.languages.label} hint={copy.languages.hint}>
+          <LanguageCheckboxes selected={languages} onChange={setLanguages} />
+        </FieldGroup>
 
-        {role === 'skipper' && (
+        {isSkipper && (
           <>
-            <Field label={copy.signup.experienceYears}>
-              <TextInput type="number" min="0" value={experienceYears} onChange={(e) => setExperienceYears(e.target.value)} />
+            <Field label={copy.experience.label}>
+              <Select value={experienceRange} onChange={(event) => setExperienceRange(event.target.value)}>
+                <option value="">{copy.experience.choose}</option>
+                {EXPERIENCE_RANGES.map((range) => (
+                  <option key={range} value={range}>{copy.experience.ranges[range]}</option>
+                ))}
+              </Select>
             </Field>
-            <Field label={copy.signup.zones}>
-              <MultiSelectTags label={copy.signup.zones} options={NAVIGATION_ZONES} selected={zones} onToggle={(value) => toggle(zones, setZones, value)} />
+            <FieldGroup label={copy.signup.zones}>
+              <MultiSelectTags options={NAVIGATION_ZONES} selected={zones} onToggle={(value) => toggle(zones, setZones, value)} labelFor={(value) => localizeZone(copy, value)} />
+            </FieldGroup>
+            <FieldGroup label={copy.signup.boatTypes}>
+              <MultiSelectTags options={SKIPPER_BOAT_TYPES} selected={boatTypes} onToggle={(value) => toggle(boatTypes, setBoatTypes, value)} labelFor={(value) => localizeBoatType(copy, value)} />
+            </FieldGroup>
+            <FieldGroup label={copy.signup.certifications}>
+              <CertificationSelect selected={certifications} onToggle={(value) => toggle(certifications, setCertifications, value)} />
+            </FieldGroup>
+            <Field label={copy.signup.permits} optionalLabel={copy.common.optional}>
+              <TextInput value={permits} onChange={(event) => setPermits(event.target.value)} />
             </Field>
-            <Field label={copy.signup.boatTypes}>
-              <MultiSelectTags label={copy.signup.boatTypes} options={SKIPPER_BOAT_TYPES} selected={boatTypes} onToggle={(value) => toggle(boatTypes, setBoatTypes, value)} />
-            </Field>
-            <Field label={copy.signup.permits}>
-              <TextInput value={permits} onChange={(e) => setPermits(e.target.value)} />
-            </Field>
-            <Field label={copy.signup.languages}>
-              <LanguageSelect selected={languages} onAdd={(language) => setLanguages((current) => [...current, language])} onRemove={(language) => setLanguages((current) => current.filter((entry) => entry !== language))} />
-            </Field>
-            <Field label={copy.signup.certifications}>
-              <CertificationSelect selected={selectedCertifications} onToggle={(value) => setSelectedCertifications((current) => current.includes(value) ? current.filter((entry) => entry !== value) : [...current, value])} />
-            </Field>
-            <Field label={copy.signup.avatarUrl}>
-              <TextInput value={avatarUrl} onChange={(e) => setAvatarUrl(e.target.value)} />
-            </Field>
-            <Field label={copy.signup.indicativeRate} hint={copy.signup.indicativeRateHint}>
-              <TextInput value={hourlyRate} onChange={(e) => setHourlyRate(e.target.value)} placeholder={DEFAULT_INDICATIVE_RATE} />
-            </Field>
-            <Field label={copy.signup.availability}>
-              <TextInput value={availabilityNote} onChange={(e) => setAvailabilityNote(e.target.value)} placeholder={copy.skippers.available} />
-            </Field>
+            <FieldGroup label={copy.availability.label}>
+              <AvailabilityEditor value={availability} onChange={setAvailability} />
+            </FieldGroup>
             <Field label={copy.signup.bio}>
-              <TextArea value={bio} onChange={(e) => setBio(e.target.value)} />
+              <TextArea value={bio} maxLength={2000} placeholder={copy.signup.bioPlaceholder} onChange={(event) => setBio(event.target.value)} />
             </Field>
           </>
         )}
 
-        <Button type="submit" disabled={loading} className="w-full flex items-center justify-center gap-2 mt-2">
-          {loading && <Loader2 className="animate-spin" size={16} />} {copy.signup.submit}
+        <label className="mb-5 flex items-start gap-2.5">
+          <input type="checkbox" checked={acceptedLegal} onChange={(event) => setAcceptedLegal(event.target.checked)} className="mt-1.5 h-4 w-4 accent-marine" />
+          <span className="text-sm leading-6 text-gray-600">
+            {copy.signup.legalIntro}{' '}
+            <Link href="/cgu" className="font-semibold text-marine underline">{copy.signup.legalTerms}</Link>{' '}
+            {copy.signup.legalAnd}{' '}
+            <Link href="/confidentialite" className="font-semibold text-marine underline">{copy.signup.legalPrivacy}</Link>. {copy.signup.legalRead}{' '}
+            <Link href="/cookies" className="font-semibold text-marine underline">{copy.signup.legalCookies}</Link>.
+          </span>
+        </label>
+
+        <Button type="submit" loading={loading} className="w-full">
+          {copy.signup.submit}
         </Button>
       </form>
-      {isDemandeur && (
-        <p className="text-xs text-center mt-3 text-gray-500">
-          {copy.signup.demandeurNote}
-        </p>
-      )}
+
+      {!isSkipper && <p className="mt-3 text-center text-xs text-gray-500">{copy.signup.recruiterNote}</p>}
+      <p className="mt-5 text-center text-sm text-gray-500">
+        {copy.signup.alreadyAccount}{' '}
+        <Link href="/login" className="font-semibold text-marine underline">{copy.signup.login}</Link>
+      </p>
     </>
   );
 }
@@ -286,9 +287,9 @@ export default function SignupPage() {
   const { copy } = useLocale();
 
   return (
-    <main className="max-w-md mx-auto px-6 py-12">
-      <div className="mb-6 flex justify-center"><BrandLogo /></div>
-      <h1 className="font-display text-2xl font-bold mb-6 text-center">{copy.signup.title}</h1>
+    <main className="mx-auto max-w-xl px-4 py-10 sm:px-6">
+      <div className="mb-5 flex justify-center"><BrandLogo size="lg" /></div>
+      <h1 className="font-display mb-6 text-center text-2xl font-bold text-marine">{copy.signup.title}</h1>
       <Suspense fallback={null}>
         <SignupForm />
       </Suspense>

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildVerifyEmailPath, isEmailVerified, requiresVerifiedEmailPath, safeNextPath } from '@/lib/auth';
-import { createEmptyPhoneValue, formatPhoneValue, phoneValueFromStored, validatePhoneValue } from '@/lib/phone';
+import { OTHER_COUNTRY, createEmptyPhoneValue, formatPhoneValue, getPhoneStorageValue, phoneValueFromStored, selectCountry, validatePhoneValue } from '@/lib/phone';
 
 test('safeNextPath keeps only internal paths', () => {
   assert.equal(safeNextPath('/messages', '/dashboard'), '/messages');
@@ -15,7 +15,8 @@ test('requiresVerifiedEmailPath only protects sensitive routes', () => {
   assert.equal(requiresVerifiedEmailPath('/missions/new'), true);
   assert.equal(requiresVerifiedEmailPath('/profile'), true);
   assert.equal(requiresVerifiedEmailPath('/dashboard'), true);
-  assert.equal(requiresVerifiedEmailPath('/skippers'), false);
+  assert.equal(requiresVerifiedEmailPath('/skippers'), true);
+  assert.equal(requiresVerifiedEmailPath('/missions'), false);
 });
 
 test('buildVerifyEmailPath preserves email and internal next path', () => {
@@ -24,21 +25,40 @@ test('buildVerifyEmailPath preserves email and internal next path', () => {
 
 test('isEmailVerified reads email confirmation state', () => {
   assert.equal(isEmailVerified({ email_confirmed_at: '2026-09-07T00:00:00.000Z' }), true);
-  assert.equal(isEmailVerified({ email_confirmed_at: null }), false);
+  assert.equal(isEmailVerified({ email_confirmed_at: undefined }), false);
 });
 
 test('phone helpers keep france default and validate per country', () => {
   const empty = createEmptyPhoneValue();
   assert.equal(empty.country, 'FR');
+  assert.equal(empty.callingCode, '+33');
 
   const french = formatPhoneValue('0612345678', 'FR');
-  assert.equal(french.isValid, true);
-  assert.equal(french.e164, '+33612345678');
+  assert.equal(french.country, 'FR');
+  assert.equal(french.callingCode, '+33');
+  assert.equal(validatePhoneValue(french, true), null);
 
-  const invalidUs = formatPhoneValue('0612345678', 'US');
-  assert.equal(validatePhoneValue(invalidUs, true).length > 0, true);
+  const invalidCode = { ...french, callingCode: '+12345' };
+  assert.equal(validatePhoneValue(invalidCode, true), 'invalidCode');
+  assert.equal(validatePhoneValue({ ...french, number: '' }, true), 'required');
+  assert.equal(validatePhoneValue({ ...french, number: '' }, false), null);
+  assert.equal(validatePhoneValue({ ...french, number: '12' }, true), 'invalid');
 
   const parsed = phoneValueFromStored('+33612345678');
   assert.equal(parsed.country, 'FR');
-  assert.equal(parsed.isValid, true);
+  assert.equal(parsed.callingCode, '+33');
+  assert.equal(parsed.number, '612345678');
+  assert.equal(validatePhoneValue(parsed, true), null);
+});
+
+test('phone input supports a manual calling code for other countries', () => {
+  const other = { ...selectCountry(createEmptyPhoneValue(), OTHER_COUNTRY), callingCode: '+971', number: '50 123 4567' };
+  assert.equal(validatePhoneValue(other, true), null);
+  const stored = getPhoneStorageValue(other);
+  assert.equal(stored, '+971 50 123 4567');
+  const restored = phoneValueFromStored(stored);
+  assert.equal(restored.country, OTHER_COUNTRY);
+  assert.equal(restored.callingCode, '+971');
+  assert.equal(restored.number, '50 123 4567');
+  assert.equal(phoneValueFromStored('+44 7700 900123').country, 'GB');
 });

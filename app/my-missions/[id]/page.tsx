@@ -1,69 +1,59 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
+import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
-import { ArrowLeft, Phone, Loader2 } from 'lucide-react';
+import { ArrowLeft, CalendarDays, MessageCircle } from 'lucide-react';
 import { useLocale } from '@/components/LocaleProvider';
-import { getExtraCopy } from '@/lib/i18n/extra';
+import { Stars, StarInput } from '@/components/star-rating';
+import { Avatar, Badge, Button, EmptyState, ErrorBanner, Field, LoadingState, SuccessBanner, TextArea } from '@/components/ui';
 import { createClient } from '@/lib/supabase/client';
 import { buildVerifyEmailPath, isEmailVerified } from '@/lib/auth';
-import { Badge, Button, EmptyState, ErrorBanner } from '@/components/ui';
-import type { Application, Mission, Review } from '@/lib/database.types';
+import { friendlyError } from '@/lib/errors';
+import { formatDateForLocale, interpolate } from '@/lib/i18n/format';
+import { localizeMissionType, localizeZone } from '@/lib/i18n/options';
+import { resolveAvatarUrls } from '@/lib/media';
+import { missionRoute } from '@/lib/mission';
+import { missionDatesLabel, missionPayLabel } from '@/lib/mission-format';
+import type { Application, Mission, Profile, Review } from '@/lib/database.types';
 
-function applicationStatusLabel(status: Application['status'], copy: ReturnType<typeof useLocale>['copy']) {
-  if (status === 'pending') return copy.nav.myApplications;
-  if (status === 'accepted') return copy.missions.assigned;
-  if (status === 'rejected') return copy.common.cancel;
-  return copy.nav.myApplications;
-}
+type ApplicationRow = Application & { profiles?: Pick<Profile, 'id' | 'full_name' | 'avatar_url'> | null };
 
-function missionStatusLabel(status: Mission['status'], copy: ReturnType<typeof useLocale>['copy']) {
-  if (status === 'open') return copy.missions.statusOpen;
-  if (status === 'assigned') return copy.missions.assigned;
-  if (status === 'completed') return copy.missions.completed;
-  return copy.missions.cancelled;
-}
-
-function stars(rating: number) {
-  return '★★★★★'.slice(0, rating) + '☆☆☆☆☆'.slice(0, 5 - rating);
-}
-
-export default function MissionApplicantsPage() {
+export default function MissionManagePage() {
   const { copy, locale } = useLocale();
-  const extra = getExtraCopy(locale);
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
   const [mission, setMission] = useState<Mission | null>(null);
-  const [applications, setApplications] = useState<Application[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [contactingId, setContactingId] = useState<string | null>(null);
-  const [updatingStatusId, setUpdatingStatusId] = useState<string | null>(null);
-  const [updatingMissionStatus, setUpdatingMissionStatus] = useState<Mission['status'] | null>(null);
-  const [error, setError] = useState('');
+  const [applications, setApplications] = useState<ApplicationRow[]>([]);
+  const [avatars, setAvatars] = useState<Record<string, string | null>>({});
   const [viewerId, setViewerId] = useState<string | null>(null);
-  const [viewerRole, setViewerRole] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [confirmingCancel, setConfirmingCancel] = useState(false);
+  const [error, setError] = useState('');
   const [myReview, setMyReview] = useState<Review | null>(null);
-  const [reviewRating, setReviewRating] = useState('5');
-  const [reviewComment, setReviewComment] = useState('');
-  const [submittingReview, setSubmittingReview] = useState(false);
-  const ratingOptions = [5, 4, 3, 2, 1];
+  const [rating, setRating] = useState(5);
+  const [comment, setComment] = useState('');
+  const [reviewMessage, setReviewMessage] = useState('');
 
-  const refreshApplications = useCallback(async (supabase = createClient()) => {
-    const { data: apps } = await supabase
-      .from('applications')
-      .select('*, profiles:skipper_id(id, full_name)')
-      .eq('mission_id', id);
-    setApplications((apps as unknown as Application[]) || []);
+  const refresh = useCallback(async () => {
+    const supabase = createClient();
+    const [{ data: missionData }, { data: apps }] = await Promise.all([
+      supabase.from('missions').select('*').eq('id', id).maybeSingle(),
+      supabase.from('applications').select('*, profiles:skipper_id(id, full_name, avatar_url)').eq('mission_id', id).order('applied_at', { ascending: true }),
+    ]);
+    setMission((missionData as Mission | null) || null);
+    const rows = (apps as unknown as ApplicationRow[]) || [];
+    setApplications(rows);
+    setAvatars(await resolveAvatarUrls(supabase, rows.map((row) => ({ id: row.skipper_id, avatar_url: row.profiles?.avatar_url }))));
   }, [id]);
 
   useEffect(() => {
     const supabase = createClient();
     (async () => {
-      const { data: auth } = await supabase.auth.getUser();
-      const user = auth.user;
+      const { data: { user } } = await supabase.auth.getUser();
       if (!user) {
-        setError(extra.common.signInRequired);
-        setLoading(false);
+        router.replace(`/login?next=/my-missions/${id}`);
         return;
       }
       if (!isEmailVerified(user)) {
@@ -71,374 +61,207 @@ export default function MissionApplicantsPage() {
         return;
       }
       setViewerId(user.id);
-
-      const { data: viewerProfile } = await supabase.from('profiles').select('role').eq('id', user.id).single();
-      setViewerRole(viewerProfile?.role ?? null);
-
-      const { data: missionData } = await supabase.from('missions').select('*').eq('id', id).single();
-
-      if (!missionData) {
-        setMission(null);
+      const { data: missionData } = await supabase.from('missions').select('poster_id').eq('id', id).maybeSingle();
+      if (!missionData || missionData.poster_id !== user.id) {
+        setError(copy.errors.accessDenied);
         setLoading(false);
         return;
       }
-
-      const isOwner = missionData.poster_id === user.id;
-      const isAdmin = viewerProfile?.role === 'admin';
-      if (!isOwner && !isAdmin) {
-        setError(extra.common.accessDenied);
-        setLoading(false);
-        return;
-      }
-
-      setMission(missionData as Mission | null);
-      await refreshApplications(supabase);
-
-      const { data: existingReview } = await supabase
-        .from('reviews')
-        .select('*')
-        .eq('mission_id', id)
-        .eq('reviewer_id', user.id)
-        .maybeSingle();
-      setMyReview((existingReview as Review | null) || null);
-
+      await refresh();
+      const { data: review } = await supabase.from('reviews').select('*').eq('mission_id', id).eq('reviewer_id', user.id).maybeSingle();
+      setMyReview((review as Review | null) || null);
       setLoading(false);
     })();
-  }, [extra.common.accessDenied, extra.common.signInRequired, id, refreshApplications, router]);
+  }, [copy, id, refresh, router]);
 
-  async function contact(skipperId: string) {
-    setContactingId(skipperId);
-    const supabase = createClient();
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) { setContactingId(null); return; }
-    if (!isEmailVerified(user)) {
-      setContactingId(null);
-      router.push(buildVerifyEmailPath(user.email || null, `/my-missions/${id}`));
-      return;
+  async function run(key: string, action: () => PromiseLike<{ error: unknown }>) {
+    setError('');
+    setBusy(key);
+    const { error: actionError } = await action();
+    setBusy(null);
+    if (actionError) {
+      setError(friendlyError(copy, actionError));
+      return false;
     }
+    await refresh();
+    return true;
+  }
 
-    const { data: missionData } = await supabase
-      .from('missions')
-      .select('poster_id')
-      .eq('id', id)
-      .single();
+  const supabase = createClient();
+  const updateApplication = (applicationId: string, status: 'accepted' | 'rejected') =>
+    run(`${applicationId}-${status}`, () => supabase.from('applications').update({ status }).eq('id', applicationId));
+  const updateMission = (status: 'completed' | 'cancelled') =>
+    run(status, () => supabase.from('missions').update({ status }).eq('id', id)).then(() => setConfirmingCancel(false));
 
-    if (!missionData || missionData.poster_id !== user.id) {
-      setError(extra.common.accessDenied);
-      setContactingId(null);
-      return;
-    }
-
-    const { data: acceptedApp, error: appError } = await supabase
-      .from('applications')
-      .select('id')
-      .eq('mission_id', id)
-      .eq('skipper_id', skipperId)
-      .eq('status', 'accepted')
-      .maybeSingle();
-
-    if (appError || !acceptedApp) {
-      setError(appError?.message || extra.common.accessDenied);
-      setContactingId(null);
-      return;
-    }
-
-    const { data: existing } = await supabase
-      .from('conversations')
-      .select('id')
-      .eq('mission_id', id)
-      .eq('skipper_id', skipperId)
-      .maybeSingle();
-
-    let convId = existing?.id;
-    if (!convId) {
-      const { data: created, error } = await supabase
+  async function openConversation(skipperId: string) {
+    if (!viewerId) return;
+    setBusy(`msg-${skipperId}`);
+    const { data: existing } = await supabase.from('conversations').select('id').eq('mission_id', id).eq('skipper_id', skipperId).maybeSingle();
+    let conversationId = existing?.id as string | undefined;
+    if (!conversationId) {
+      const { data: created, error: createError } = await supabase
         .from('conversations')
-        .insert({ mission_id: id, demandeur_id: user.id, skipper_id: skipperId })
-        .select()
+        .insert({ mission_id: id, demandeur_id: viewerId, skipper_id: skipperId })
+        .select('id')
         .single();
-      if (error) { setContactingId(null); return; }
-      convId = created.id;
+      if (createError || !created) {
+        setBusy(null);
+        setError(createError ? friendlyError(copy, createError) : copy.messaging.stale);
+        return;
+      }
+      conversationId = created.id;
     }
-    router.push(`/messages?conversation=${convId}`);
-  }
-
-  async function updateApplicationStatus(applicationId: string, status: 'accepted' | 'rejected') {
-    setError('');
-    setUpdatingStatusId(applicationId);
-    const supabase = createClient();
-
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) {
-      setUpdatingStatusId(null);
-      setError(extra.common.signInRequired);
-      return;
-    }
-    if (!isEmailVerified(user)) {
-      setUpdatingStatusId(null);
-      router.push(buildVerifyEmailPath(user.email || null, `/my-missions/${id}`));
-      return;
-    }
-
-    const { data: missionGuard } = await supabase
-      .from('missions')
-      .select('poster_id')
-      .eq('id', id)
-      .single();
-
-    if (!missionGuard || missionGuard.poster_id !== user.id) {
-      setUpdatingStatusId(null);
-      setError(extra.common.accessDenied);
-      return;
-    }
-
-    const { error: updErr } = await supabase
-      .from('applications')
-      .update({ status })
-      .eq('id', applicationId)
-      .select('*')
-      .single();
-
-    setUpdatingStatusId(null);
-
-    if (updErr) {
-      setError(updErr.message);
-      return;
-    }
-
-    await refreshApplications(supabase);
-    const { data: missionData } = await supabase
-      .from('missions')
-      .select('*')
-      .eq('id', id)
-      .single();
-    if (missionData) {
-      setMission(missionData as Mission);
-    }
-  }
-
-  async function updateMissionStatus(status: 'completed' | 'cancelled') {
-    setError('');
-    setUpdatingMissionStatus(status);
-    const supabase = createClient();
-
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) {
-      setUpdatingMissionStatus(null);
-      setError(extra.common.signInRequired);
-      return;
-    }
-    if (!isEmailVerified(user)) {
-      setUpdatingMissionStatus(null);
-      router.push(buildVerifyEmailPath(user.email || null, `/my-missions/${id}`));
-      return;
-    }
-
-    const { data: missionGuard } = await supabase
-      .from('missions')
-      .select('poster_id')
-      .eq('id', id)
-      .single();
-
-    if (!missionGuard || missionGuard.poster_id !== user.id) {
-      setUpdatingMissionStatus(null);
-      setError(extra.common.accessDenied);
-      return;
-    }
-
-    const { data, error: updErr } = await supabase
-      .from('missions')
-      .update({ status })
-      .eq('id', id)
-      .select('*')
-      .single();
-
-    setUpdatingMissionStatus(null);
-
-    if (updErr) {
-      setError(updErr.message);
-      return;
-    }
-
-    setMission(data as Mission);
+    router.push(`/messages?conversation=${conversationId}`);
   }
 
   async function submitReview() {
+    const accepted = applications.find((application) => application.status === 'accepted');
+    if (!mission || !viewerId || !accepted) return;
     setError('');
-    if (!mission || !viewerId) return;
-
-    const acceptedApplication = applications.find((application) => application.status === 'accepted');
-    if (!acceptedApplication) {
-      setError(extra.common.accessDenied);
-      return;
-    }
-
-    if (mission.status !== 'completed') {
-      setError(extra.common.accessDenied);
-      return;
-    }
-
-    setSubmittingReview(true);
-    const supabase = createClient();
+    setBusy('review');
     const { data, error: insertError } = await supabase
       .from('reviews')
-      .insert({
-        mission_id: mission.id,
-        reviewer_id: viewerId,
-        reviewee_id: acceptedApplication.skipper_id,
-        rating: Number(reviewRating),
-        comment: reviewComment.trim() || null,
-      })
+      .insert({ mission_id: mission.id, reviewer_id: viewerId, reviewee_id: accepted.skipper_id, rating, comment: comment.trim() || null })
       .select('*')
       .single();
-    setSubmittingReview(false);
-
+    setBusy(null);
     if (insertError) {
-      setError(insertError.code === '23505' ? extra.common.review : insertError.message);
+      setError((insertError as { code?: string }).code === '23505' ? copy.missionManage.review.already : friendlyError(copy, insertError));
       return;
     }
-
     setMyReview(data as Review);
-    setReviewComment('');
+    setReviewMessage(copy.missionManage.review.published);
   }
 
-  if (loading) return <div className="flex items-center gap-2 py-16 justify-center text-gray-500"><Loader2 className="animate-spin" size={20} /> {copy.common.loading}</div>;
-  if (!mission) return <main className="max-w-lg mx-auto px-6 py-10"><p>{copy.missions.noResult}</p></main>;
+  if (loading) return <LoadingState label={copy.common.loading} />;
+  if (!mission) {
+    return (
+      <main className="mx-auto max-w-2xl px-4 py-10 sm:px-6">
+        <BackLink label={copy.missionManage.back} />
+        <ErrorBanner message={error || copy.errors.notFound} />
+      </main>
+    );
+  }
 
-  const canManageMission = viewerId === mission.poster_id || viewerRole === 'admin';
-  const acceptedApplication = applications.find((application) => application.status === 'accepted') || null;
-  const canReview = mission.status === 'completed' && viewerId === mission.poster_id && !!acceptedApplication;
+  const accepted = applications.find((application) => application.status === 'accepted') || null;
+  const statusTone = (status: Application['status']) => (status === 'accepted' ? 'success' : status === 'rejected' ? 'danger' : status === 'withdrawn' ? 'muted' : 'warning');
 
   return (
-    <main className="max-w-lg mx-auto px-6 py-10">
-      <button onClick={() => router.push('/my-missions')} className="text-sm font-semibold mb-4 flex items-center gap-1 text-gray-500">
-        <ArrowLeft size={14} /> {copy.nav.myMissions}
-      </button>
-      <Badge>{mission.type}</Badge>
-      <h1 className="font-display text-2xl font-bold mt-3 mb-1">{mission.departure}{mission.destination ? ` → ${mission.destination}` : ''}</h1>
-      <p className="text-sm mb-6 text-gray-500">{applications.length} {copy.nav.myApplications.toLowerCase()}</p>
-      <div className="rounded-2xl p-5 mb-6 bg-white border border-navy/[0.08] space-y-3">
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">{copy.missions.status}</span>
-          <span className="text-xs font-semibold px-3 py-1.5 rounded-full bg-lightblue text-navy">{missionStatusLabel(mission.status, copy)}</span>
+    <main className="mx-auto max-w-3xl px-4 py-10 sm:px-6">
+      <BackLink label={copy.missionManage.back} />
+
+      <section className="mb-6 rounded-2xl border border-navy/[0.08] bg-white p-5">
+        <div className="mb-3 flex flex-wrap items-center gap-2">
+          <Badge>{localizeMissionType(copy, mission.type)}</Badge>
+          <Badge tone={mission.status === 'open' ? 'success' : 'muted'}>{copy.missions.statuses[mission.status]}</Badge>
         </div>
-        <div className="flex flex-wrap gap-2">
-          {canManageMission && mission.status === 'open' && (
-            <Button
-              type="button"
-              variant="outline"
-              className="text-sm px-4 py-2"
-              disabled={!!updatingMissionStatus}
-              onClick={() => updateMissionStatus('cancelled')}
-            >
-              {updatingMissionStatus === 'cancelled' ? '...' : copy.missions.cancelled}
+        <h1 className="font-display mb-2 text-2xl font-bold text-marine">{missionRoute(mission)}</h1>
+        <p className="flex items-center gap-2 text-sm text-gray-600"><CalendarDays size={14} className="text-gray-400" /> {missionDatesLabel(copy, locale, mission)} · {localizeZone(copy, mission.zone)}</p>
+        <p className="mt-1 text-sm font-semibold text-marine">{missionPayLabel(copy, locale, mission)}</p>
+
+        <div className="mt-4 flex flex-wrap gap-2">
+          <Link href={`/missions/${mission.id}`} className="rounded-lg px-3 py-2 text-sm font-semibold text-marine underline">{copy.missionManage.viewPublic}</Link>
+          {mission.status === 'assigned' && (
+            <Button type="button" size="sm" loading={busy === 'completed'} onClick={() => updateMission('completed')}>
+              {copy.missionManage.markCompleted}
             </Button>
           )}
-          {canManageMission && mission.status === 'assigned' && (
-            <>
-              <Button
-                type="button"
-                className="text-sm px-4 py-2"
-                disabled={!!updatingMissionStatus}
-                onClick={() => updateMissionStatus('completed')}
-              >
-                {updatingMissionStatus === 'completed' ? '...' : copy.missions.completed}
+          {(mission.status === 'open' || mission.status === 'assigned') && (
+            confirmingCancel ? (
+              <Button type="button" variant="danger" size="sm" loading={busy === 'cancelled'} onClick={() => updateMission('cancelled')}>
+                {copy.missionManage.confirmCancel}
               </Button>
-              <Button
-                type="button"
-                variant="outline"
-                className="text-sm px-4 py-2"
-                disabled={!!updatingMissionStatus}
-                onClick={() => updateMissionStatus('cancelled')}
-              >
-                {updatingMissionStatus === 'cancelled' ? '...' : copy.missions.cancelled}
+            ) : (
+              <Button type="button" variant="outline" size="sm" onClick={() => setConfirmingCancel(true)}>
+                {copy.missionManage.cancelMission}
               </Button>
-            </>
+            )
           )}
         </div>
-      </div>
+      </section>
+
       <ErrorBanner message={error} />
 
+      <h2 className="mb-3 text-sm font-bold uppercase tracking-[0.12em] text-gray-500">{copy.missionManage.applicants}</h2>
       {applications.length === 0 ? (
-        <EmptyState text={copy.messages.empty} />
+        <EmptyState text={copy.missionManage.noApplicants} />
       ) : (
-        <div className="space-y-3">
-          {applications.map((a) => (
-            <div key={a.id} className="rounded-2xl p-5 bg-white border border-navy/[0.08]">
-              <h4 className="font-bold text-[15px] mb-2">{a.profiles?.full_name}</h4>
-              {a.status === 'accepted' && a.phone && <div className="flex items-center gap-1.5 text-xs mb-3 text-gray-500"><Phone size={12} /> {a.phone}</div>}
-              {a.message && <p className="text-sm mb-3">{a.message}</p>}
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-xs font-semibold px-3 py-1.5 rounded-full bg-lightblue text-navy">{applicationStatusLabel(a.status, copy)}</span>
-                {a.status === 'pending' && (
-                  <>
-                    <Button
-                      onClick={() => updateApplicationStatus(a.id, 'accepted')}
-                      disabled={updatingStatusId === a.id || mission.status !== 'open'}
-                      className="text-sm px-4 py-2"
-                    >
-                      {copy.common.yes}
+        <ul className="space-y-3">
+          {applications.map((application) => {
+            const name = application.profiles?.full_name || copy.roles.skipper;
+            const canTalk = application.status === 'pending' || application.status === 'accepted';
+            return (
+              <li key={application.id} className="rounded-2xl border border-navy/[0.08] bg-white p-4 sm:p-5">
+                <div className="flex flex-wrap items-center gap-3">
+                  <Avatar name={name} url={avatars[application.skipper_id]} size={44} />
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate font-semibold">{name}</p>
+                    <p className="text-xs text-gray-500">{interpolate(copy.applications.appliedOn, { date: formatDateForLocale(application.applied_at, locale) })}</p>
+                  </div>
+                  <Badge tone={statusTone(application.status)}>{copy.missionManage.applicationStatuses[application.status]}</Badge>
+                </div>
+                {application.message && <p className="mt-3 whitespace-pre-line text-sm text-gray-700">{application.message}</p>}
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <Link href={`/skippers/${application.skipper_id}`} className="inline-flex min-h-[40px] items-center rounded-xl border border-gray-200 px-3.5 py-2 text-sm font-semibold text-marine hover:bg-lightblue">
+                    {copy.missionManage.viewProfile}
+                  </Link>
+                  {canTalk && (
+                    <Button type="button" variant="outline" size="sm" loading={busy === `msg-${application.skipper_id}`} onClick={() => openConversation(application.skipper_id)}>
+                      <MessageCircle size={15} /> {copy.missionManage.message}
                     </Button>
-                    <Button
-                      onClick={() => updateApplicationStatus(a.id, 'rejected')}
-                      disabled={updatingStatusId === a.id || mission.status !== 'open'}
-                      variant="outline"
-                      className="text-sm px-4 py-2"
-                    >
-                      {copy.common.no}
-                    </Button>
-                  </>
-                )}
-                {a.status === 'accepted' && (
-                  <Button onClick={() => contact(a.skipper_id)} disabled={contactingId === a.skipper_id} className="text-sm px-4 py-2">
-                    {contactingId === a.skipper_id ? '...' : copy.messages.title}
-                  </Button>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
+                  )}
+                  {application.status === 'pending' && mission.status === 'open' && (
+                    <>
+                      <Button type="button" size="sm" loading={busy === `${application.id}-accepted`} onClick={() => updateApplication(application.id, 'accepted')}>
+                        {copy.missionManage.accept}
+                      </Button>
+                      <Button type="button" variant="ghost" size="sm" loading={busy === `${application.id}-rejected`} onClick={() => updateApplication(application.id, 'rejected')}>
+                        {copy.missionManage.reject}
+                      </Button>
+                    </>
+                  )}
+                </div>
+              </li>
+            );
+          })}
+        </ul>
       )}
 
-      {canReview && (
-        <section className="rounded-2xl p-5 mt-6 bg-white border border-navy/[0.08] space-y-3">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-500">{extra.common.review}</h2>
-          {myReview ? (
-            <>
-              <div className="text-sm font-semibold text-navy">{stars(myReview.rating)} ({myReview.rating}/5)</div>
-              {myReview.comment && <p className="text-sm text-gray-600">{myReview.comment}</p>}
-              <p className="text-xs text-gray-500">{extra.common.published}</p>
-            </>
+      {accepted && (
+        <section className="mt-8 rounded-2xl border border-navy/[0.08] bg-white p-5">
+          <h2 className="font-display mb-3 text-lg font-bold text-marine">{copy.missionManage.review.title}</h2>
+          <SuccessBanner message={reviewMessage} />
+          {mission.status !== 'completed' ? (
+            <p className="text-sm text-gray-500">{copy.missionManage.review.afterCompletion}</p>
+          ) : myReview ? (
+            <div>
+              <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-gray-500">{copy.missionManage.review.yourReview}</p>
+              <Stars rating={myReview.rating} size={18} />
+              {myReview.comment && <p className="mt-2 text-sm italic text-gray-700">{myReview.comment}</p>}
+            </div>
           ) : (
-            <>
-              <label className="block">
-                <span className="block text-xs font-semibold uppercase tracking-wide mb-1.5 text-gray-500">{extra.common.review}</span>
-                <select
-                  value={reviewRating}
-                  onChange={(event) => setReviewRating(event.target.value)}
-                  className="w-full border border-gray-200 rounded-[10px] px-3.5 py-2.5 text-sm bg-white"
-                >
-                  {ratingOptions.map((value) => (
-                    <option key={value} value={String(value)}>{value} / 5</option>
-                  ))}
-                </select>
-              </label>
-              <label className="block">
-                <span className="block text-xs font-semibold uppercase tracking-wide mb-1.5 text-gray-500">{copy.messages.title}</span>
-                <textarea
-                  value={reviewComment}
-                  onChange={(event) => setReviewComment(event.target.value)}
-                  className="w-full border border-gray-200 rounded-[10px] px-3.5 py-2.5 text-sm min-h-[90px]"
-                  placeholder={`${extra.common.review}...`}
-                />
-              </label>
-              <Button type="button" onClick={submitReview} disabled={submittingReview} className="w-full">
-                {submittingReview ? '...' : extra.common.publishReview}
+            <div>
+              <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-gray-500">{copy.missionManage.review.rating}</p>
+              <StarInput value={rating} onChange={setRating} />
+              <p className="mb-4 mt-1 text-sm text-gray-500">{interpolate(copy.missionManage.review.ratingValue, { rating })}</p>
+              <Field label={copy.missionManage.review.comment} optionalLabel={copy.common.optional}>
+                <TextArea value={comment} maxLength={1000} placeholder={copy.missionManage.review.commentPlaceholder} onChange={(event) => setComment(event.target.value)} />
+              </Field>
+              <Button type="button" loading={busy === 'review'} onClick={submitReview}>
+                {copy.missionManage.review.submit}
               </Button>
-            </>
+            </div>
           )}
         </section>
       )}
     </main>
+  );
+}
+
+function BackLink({ label }: { label: string }) {
+  return (
+    <Link href="/my-missions" className="mb-5 inline-flex items-center gap-1.5 text-sm font-semibold text-gray-500 hover:text-marine">
+      <ArrowLeft size={15} className="rtl:rotate-180" /> {label}
+    </Link>
   );
 }

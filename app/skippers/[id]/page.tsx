@@ -1,206 +1,143 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
-import { ArrowLeft, ShieldCheck, Loader2 } from 'lucide-react';
+import { ArrowLeft } from 'lucide-react';
 import { useLocale } from '@/components/LocaleProvider';
-import { getExtraCopy } from '@/lib/i18n/extra';
+import SkipperReviews, { type ReviewWithContext } from '@/components/skipper-reviews';
+import { Avatar, ErrorBanner, LoadingState } from '@/components/ui';
 import { createClient } from '@/lib/supabase/client';
-import { Button, initials } from '@/components/ui';
-import { formatDateForLocale } from '@/lib/i18n/format';
-import { formatAvailabilitySummary, indicativeRateLabel, normalizeProfileCertifications } from '@/lib/profile';
-import { resolveAvatarUrl } from '@/lib/media';
-import type { Profile, Review } from '@/lib/database.types';
-
-function stars(rating: number) {
-  return '★★★★★'.slice(0, rating) + '☆☆☆☆☆'.slice(0, 5 - rating);
-}
-
-type PublicReview = Review & {
-  reviewer?: { full_name: string }[] | { full_name: string } | null;
-};
-
-function reviewerName(review: PublicReview) {
-  if (!review.reviewer) return 'User';
-  if (Array.isArray(review.reviewer)) return review.reviewer[0]?.full_name || 'User';
-  return review.reviewer.full_name;
-}
+import { describeAvailability } from '@/lib/availability-format';
+import { friendlyError } from '@/lib/errors';
+import { languageName, formatList } from '@/lib/i18n/format';
+import { localizeBoatType, localizeZone } from '@/lib/i18n/options';
+import { displayName, fetchProfileCards, resolveAvatarUrl } from '@/lib/media';
+import { missionRoute } from '@/lib/mission';
+import { isRecruiterRole } from '@/lib/onboarding';
+import { normalizeProfileCertifications } from '@/lib/profile';
+import { profileExperienceRange } from '@/lib/profile-options';
+import type { Mission, Profile, Review } from '@/lib/database.types';
 
 export default function SkipperProfilePage() {
   const { copy, locale } = useLocale();
-  const extra = getExtraCopy(locale);
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
   const [skipper, setSkipper] = useState<Profile | null>(null);
-  const [viewerRole, setViewerRole] = useState<string | null>(null);
+  const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
+  const [reviews, setReviews] = useState<ReviewWithContext[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
-  const [reputation, setReputation] = useState<{ average: number; count: number } | null>(null);
-  const [recentReviews, setRecentReviews] = useState<PublicReview[]>([]);
 
   useEffect(() => {
     const supabase = createClient();
     (async () => {
-      try {
-        const { data, error: profileError } = await supabase.from('profiles').select('*, availability_slots(*)').eq('id', id).maybeSingle();
-        if (profileError) {
-          setError(profileError.message);
-          setSkipper(null);
-          return;
-        }
-
-        setSkipper(data as Profile | null);
-        setAvatarUrl(await resolveAvatarUrl(supabase, data?.avatar_url));
-
-        const { data: reviewRows } = await supabase
-          .from('reviews')
-          .select('rating')
-          .eq('reviewee_id', id);
-
-        const ratingRows = (reviewRows as Array<{ rating: number }>) || [];
-        if (ratingRows.length > 0) {
-          const total = ratingRows.reduce((accumulator, row) => accumulator + row.rating, 0);
-          setReputation({ average: total / ratingRows.length, count: ratingRows.length });
-        } else {
-          setReputation(null);
-        }
-
-        const { data: reviewsData } = await supabase
-          .from('reviews')
-          .select('id, mission_id, reviewer_id, reviewee_id, rating, comment, created_at, reviewer:reviewer_id(full_name)')
-          .eq('reviewee_id', id)
-          .order('created_at', { ascending: false })
-          .limit(5);
-        setRecentReviews((reviewsData as PublicReview[]) || []);
-
-        const { data: { user }, error: userError } = await supabase.auth.getUser();
-        if (userError && !/Auth session missing/i.test(userError.message)) {
-          setError(userError.message);
-          return;
-        }
-
-        if (user) {
-          const { data: viewer, error: viewerError } = await supabase.from('profiles').select('role').eq('id', user.id).single();
-          if (viewerError) {
-            setError(viewerError.message);
-            return;
-          }
-          setViewerRole(viewer?.role ?? null);
-        }
-      } catch (err) {
-        setError(err instanceof Error ? err.message : extra.errors.loadProfile);
-      } finally {
-        setLoading(false);
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) {
+        router.replace(`/login?next=/skippers/${id}`);
+        return;
       }
-    })();
-  }, [extra.errors.loadProfile, id]);
+      const { data: me } = await supabase.from('profiles').select('role').eq('id', user.id).single();
+      // Skipper profiles are reserved to owners, brokers and agencies (also enforced by RLS).
+      if (!me || (!isRecruiterRole(me.role) && me.role !== 'admin')) {
+        router.replace('/dashboard');
+        return;
+      }
+      const { data, error: profileError } = await supabase.from('profiles').select('*, availability_slots(*)').eq('id', id).eq('role', 'skipper').maybeSingle();
+      if (profileError || !data) {
+        setError(profileError ? friendlyError(copy, profileError) : copy.skippers.noResult);
+        setLoading(false);
+        return;
+      }
+      const profile = data as Profile;
+      setSkipper(profile);
+      setAvatarUrl(await resolveAvatarUrl(supabase, profile.avatar_url));
 
-  if (loading) return <div className="flex items-center gap-2 py-16 justify-center text-gray-500"><Loader2 className="animate-spin" size={20} /> {copy.common.loading}</div>;
-  if (error) {
+      const { data: reviewRows } = await supabase
+        .from('reviews')
+        .select('*, missions(departure, destination)')
+        .eq('reviewee_id', id)
+        .order('created_at', { ascending: false });
+      const rows = (reviewRows as unknown as Array<Review & { missions: Pick<Mission, 'departure' | 'destination'> | null }>) || [];
+      const cards = await fetchProfileCards(supabase, rows.map((row) => row.reviewer_id));
+      setReviews(rows.map((row) => ({ ...row, reviewerName: displayName(cards[row.reviewer_id]), missionLabel: row.missions ? missionRoute(row.missions) : null })));
+      setLoading(false);
+    })();
+  }, [copy, id, router]);
+
+  if (loading) return <LoadingState label={copy.common.loading} />;
+  if (!skipper) {
     return (
-      <main className="max-w-lg mx-auto px-6 py-10">
-        <div className="rounded-2xl p-5 bg-white border border-red-200 text-sm text-red-700">{error}</div>
+      <main className="mx-auto max-w-3xl px-4 py-10 sm:px-6">
+        <BackLink label={copy.skipperProfile.back} />
+        <ErrorBanner message={error || copy.skippers.noResult} />
       </main>
     );
   }
-  if (!skipper) return <main className="max-w-lg mx-auto px-6 py-10"><p>{copy.skippers.noResult}</p></main>;
 
-  const galleryUrls = skipper.gallery_urls || [];
-  const certifications = normalizeProfileCertifications(skipper.certifications);
-  const availabilitySummary = skipper.availability_slots?.length ? formatAvailabilitySummary(skipper.availability_slots) : skipper.availability_note;
-
-  const isDemandeur = viewerRole && viewerRole !== 'skipper' && viewerRole !== 'admin';
+  const range = profileExperienceRange(skipper);
+  const certifications = normalizeProfileCertifications(skipper.certifications).map((cert) => cert.name);
+  const availabilityLines = describeAvailability(copy, locale, skipper);
 
   return (
-    <main className="max-w-lg mx-auto px-6 py-10">
-      <button onClick={() => router.push('/skippers')} className="text-sm font-semibold mb-4 flex items-center gap-1 text-gray-500">
-        <ArrowLeft size={14} /> {copy.skippers.title}
-      </button>
-      <div className="w-14 h-14 rounded-full flex items-center justify-center mb-4 font-bold text-lg bg-navyDeep text-white overflow-hidden">
-        {avatarUrl ? (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img src={avatarUrl} alt={skipper.full_name} className="h-full w-full object-cover" />
-        ) : (
-          initials(skipper.full_name)
+    <main className="mx-auto max-w-3xl px-4 py-10 sm:px-6">
+      <BackLink label={copy.skipperProfile.back} />
+
+      <section className="mb-5 flex flex-col items-center gap-4 rounded-2xl border border-navy/[0.08] bg-white p-6 text-center sm:flex-row sm:text-start">
+        <Avatar name={skipper.full_name} url={avatarUrl} size={120} className="border-4 border-lightblue" />
+        <div className="min-w-0">
+          <h1 className="font-display text-2xl font-bold text-marine sm:text-3xl">{skipper.full_name}</h1>
+          <p className="mt-1 font-medium text-navy">{range ? copy.experience.ranges[range] : copy.common.notSpecified}</p>
+          {skipper.city && <p className="text-sm text-gray-500">{skipper.city}</p>}
+        </div>
+      </section>
+
+      <div className="grid gap-4 sm:grid-cols-2">
+        <InfoCard title={copy.skipperProfile.languages}>
+          {(skipper.languages || []).length ? formatList((skipper.languages || []).map((code) => languageName(code, locale)), locale) : copy.common.notSpecified}
+        </InfoCard>
+        <InfoCard title={copy.skipperProfile.availability}>
+          <ul className="space-y-0.5">{availabilityLines.map((line) => <li key={line}>{line}</li>)}</ul>
+        </InfoCard>
+        <InfoCard title={copy.skipperProfile.zones}>
+          {(skipper.zones || []).length ? formatList((skipper.zones || []).map((zone) => localizeZone(copy, zone)), locale) : copy.common.notSpecified}
+        </InfoCard>
+        <InfoCard title={copy.skipperProfile.boatTypes}>
+          {(skipper.boat_types || []).length ? formatList((skipper.boat_types || []).map((boat) => localizeBoatType(copy, boat)), locale) : copy.common.notSpecified}
+        </InfoCard>
+        {(certifications.length > 0 || skipper.permits) && (
+          <InfoCard title={copy.skipperProfile.qualifications} wide>
+            <div className="flex flex-wrap gap-2">
+              {certifications.map((name) => <span key={name} className="rounded-full bg-lightblue px-3 py-1 text-xs font-semibold text-marine">{name}</span>)}
+            </div>
+            {skipper.permits && <p className={certifications.length ? 'mt-2' : ''}>{skipper.permits}</p>}
+          </InfoCard>
+        )}
+        {skipper.bio && (
+          <InfoCard title={copy.skipperProfile.about} wide>
+            <p dir="auto" className="whitespace-pre-line leading-7">{skipper.bio}</p>
+          </InfoCard>
         )}
       </div>
-      <h1 className="font-display text-2xl font-bold mb-1">{skipper.full_name}</h1>
-      <span className="inline-flex items-center gap-1 text-xs font-semibold px-2.5 py-1 rounded-full mb-4 bg-lightblue text-navy">
-        <ShieldCheck size={12} /> {skipper.identity_verified ? copy.common.yes : copy.common.no}
-      </span>
-      {reputation ? (
-        <p className="text-sm mb-4 text-gray-600">★ {reputation.average.toFixed(1)} ({reputation.count})</p>
-      ) : (
-        <p className="text-sm mb-4 text-gray-500">{copy.notifications.none}</p>
-      )}
 
-      <div className="rounded-2xl p-5 mb-6 space-y-3 bg-white border border-navy/[0.08]">
-        {skipper.experience_years !== null && <Row label={copy.skippers.experience} value={`${skipper.experience_years}`} />}
-        {skipper.zones?.length > 0 && <Row label={copy.skippers.zone} value={skipper.zones.join(', ')} />}
-        {skipper.boat_types?.length > 0 && <Row label={copy.skippers.boatType} value={skipper.boat_types.join(', ')} />}
-        {skipper.languages?.length > 0 && <Row label={copy.skippers.language} value={skipper.languages.join(', ')} />}
-        {certifications.length > 0 && <Row label={copy.signup.certifications} value={certifications.map((cert) => cert.name).join(', ')} />}
-        {skipper.permits && <Row label={copy.signup.permits} value={skipper.permits} />}
-        {availabilitySummary && <Row label={copy.skippers.availability} value={availabilitySummary} />}
-        {skipper.hourly_rate && <Row label={copy.skippers.rate} value={indicativeRateLabel(skipper.hourly_rate)} />}
-      </div>
-
-      {galleryUrls.length > 0 && (
-        <section className="mb-6">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-500 mb-3">{copy.profile.photo}</h2>
-          <div className="grid gap-3 sm:grid-cols-2">
-            {galleryUrls.map((url, index) => (
-              <a
-                key={`${url}-${index}`}
-                href={url}
-                target="_blank"
-                rel="noreferrer"
-                className="block overflow-hidden rounded-2xl border border-navy/[0.08] bg-white"
-              >
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src={url} alt={`${skipper.full_name} - photo ${index + 1}`} className="h-44 w-full object-cover" />
-              </a>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {skipper.bio && <p className="text-sm mb-6 leading-relaxed">{skipper.bio}</p>}
-
-      {recentReviews.length > 0 && (
-        <section className="rounded-2xl p-5 mb-6 bg-white border border-navy/[0.08]">
-          <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-500 mb-3">{extra.common.review}</h2>
-          <div className="space-y-3">
-            {recentReviews.map((review) => (
-              <article key={review.id} className="rounded-xl border border-navy/[0.06] p-3">
-                <div className="flex items-center justify-between gap-2">
-                  <p className="text-xs font-semibold text-navy">{stars(review.rating)} ({review.rating}/5)</p>
-                  <p className="text-xs text-gray-500">{formatDateForLocale(review.created_at, locale)}</p>
-                </div>
-                {review.comment && <p className="text-sm mt-1 text-gray-700">{review.comment}</p>}
-                <p className="text-xs mt-1 text-gray-500">{reviewerName(review)}</p>
-              </article>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {isDemandeur ? (
-        <Button onClick={() => router.push('/missions/new')} className="w-full">{copy.nav.publishMission}</Button>
-      ) : (
-        <Button onClick={() => router.push('/signup?role=owner')} className="w-full">{copy.signup.title}</Button>
-      )}
-      <p className="text-xs text-center mt-2 text-gray-500">{copy.messages.verifyFirst}</p>
+      <SkipperReviews reviews={reviews} />
     </main>
   );
 }
 
-function Row({ label, value }: { label: string; value: string }) {
+function BackLink({ label }: { label: string }) {
   return (
-    <div className="flex justify-between text-sm">
-      <span className="text-gray-500">{label}</span>
-      <span className="font-medium text-right">{value}</span>
-    </div>
+    <Link href="/skippers" className="mb-5 inline-flex items-center gap-1.5 text-sm font-semibold text-gray-500 hover:text-marine">
+      <ArrowLeft size={15} className="rtl:rotate-180" /> {label}
+    </Link>
+  );
+}
+
+function InfoCard({ title, children, wide = false }: { title: string; children: React.ReactNode; wide?: boolean }) {
+  return (
+    <section className={`rounded-2xl border border-navy/[0.08] bg-white p-5 ${wide ? 'sm:col-span-2' : ''}`}>
+      <h2 className="mb-2 text-xs font-bold uppercase tracking-[0.12em] text-gray-500">{title}</h2>
+      <div className="text-[15px] text-anthracite">{children}</div>
+    </section>
   );
 }

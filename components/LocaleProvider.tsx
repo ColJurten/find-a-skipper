@@ -2,13 +2,13 @@
 
 import { createContext, useCallback, useContext, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { getCopy } from '@/lib/i18n/copy';
-import { DEFAULT_LOCALE, LOCALE_COOKIE_NAME, type SupportedLocale } from '@/lib/i18n/locales';
+import { getCopy, type Messages } from '@/lib/i18n/copy';
+import { DEFAULT_LOCALE, LOCALE_COOKIE_NAME, localeDirection, type SupportedLocale } from '@/lib/i18n/locales';
 
 type LocaleContextValue = {
   locale: SupportedLocale;
   setLocale: (locale: SupportedLocale) => void;
-  copy: ReturnType<typeof getCopy>;
+  copy: Messages;
 };
 
 const LocaleContext = createContext<LocaleContextValue | null>(null);
@@ -19,6 +19,9 @@ export function LocaleProvider({ initialLocale, children }: { initialLocale: Sup
 
   const setLocale = useCallback((nextLocale: SupportedLocale) => {
     document.cookie = `${LOCALE_COOKIE_NAME}=${nextLocale}; path=/; max-age=31536000; samesite=lax`;
+    // Apply language + direction immediately; server components re-render on refresh.
+    document.documentElement.lang = nextLocale;
+    document.documentElement.dir = localeDirection(nextLocale);
     setLocaleState(nextLocale);
     router.refresh();
   }, [router]);
