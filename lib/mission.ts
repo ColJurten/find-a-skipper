@@ -14,6 +14,14 @@ export function missionRoute(mission: Pick<Mission, 'departure' | 'destination'>
 }
 
 /**
+ * Value for missions.title: in production this column is NOT NULL without default
+ * (it predates the tracked migrations), so every insert must provide it.
+ */
+export function missionTitle(mission: { type: string; departure: string; destination?: string | null }) {
+  return `${mission.type} - ${missionRoute({ departure: mission.departure.trim(), destination: mission.destination?.trim() || null })}`.slice(0, 200);
+}
+
+/**
  * Amount as entered by the recruiter ("350 €"), or null when no amount was given.
  * Legacy missions only have the free-text `compensation` column.
  */
