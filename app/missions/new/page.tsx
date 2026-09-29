@@ -8,7 +8,7 @@ import { createClient } from '@/lib/supabase/client';
 import { buildVerifyEmailPath, isEmailVerified } from '@/lib/auth';
 import { friendlyError } from '@/lib/errors';
 import { localizeBoatType, localizeMissionType, localizeZone } from '@/lib/i18n/options';
-import { isSingleDayMissionType, parseDecimal, validateMissionForm } from '@/lib/mission';
+import { isSingleDayMissionType, missionTitle, parseDecimal, validateMissionForm } from '@/lib/mission';
 import { isRecruiterRole } from '@/lib/onboarding';
 import { MISSION_TYPES, NAVIGATION_ZONES, SKIPPER_BOAT_TYPES } from '@/lib/profile-options';
 import type { MissionCurrency } from '@/lib/database.types';
@@ -76,6 +76,7 @@ export default function NewMissionPage() {
     const { error: insertError } = await supabase
       .from('missions')
       .insert({
+        title: missionTitle({ type, departure, destination }),
         poster_id: userId,
         status: 'open',
         type,

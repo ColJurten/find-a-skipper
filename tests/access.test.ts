@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { canAccessPath } from '@/lib/access';
 import { isCurrentApplication, canWithdrawApplication } from '@/lib/applications';
 import { isAvailableDuring, matchesAvailabilityFilter, normalizePeriod, validateAvailability, emptyAvailability } from '@/lib/availability';
-import { matchesMissionStatusFilter, validateMissionForm, missionAmountLabel } from '@/lib/mission';
+import { matchesMissionStatusFilter, validateMissionForm, missionAmountLabel, missionTitle } from '@/lib/mission';
 import { experienceRangeFromYears, profileExperienceRange } from '@/lib/profile-options';
 import { friendlyError } from '@/lib/errors';
 import { dictionaries } from '@/lib/i18n/copy';
@@ -102,4 +102,10 @@ test('technical errors are translated, never shown raw', () => {
   assert.equal(friendlyError(fr, new TypeError('Failed to fetch')), fr.errors.network);
   assert.equal(friendlyError(fr, { message: 'duplicate key value', code: '23505' }), fr.errors.duplicate);
   assert.equal(friendlyError(dictionaries.ar, { message: 'something odd' }), dictionaries.ar.errors.generic);
+});
+
+test('mission title is always provided (production column is NOT NULL)', () => {
+  assert.equal(missionTitle({ type: 'À la semaine', departure: ' Le Marin ', destination: 'Grenadines' }), 'À la semaine - Le Marin → Grenadines');
+  assert.equal(missionTitle({ type: 'Permanent', departure: 'Antibes', destination: null }), 'Permanent - Antibes');
+  assert.equal(missionTitle({ type: 'Permanent', departure: 'Antibes', destination: '  ' }), 'Permanent - Antibes');
 });
